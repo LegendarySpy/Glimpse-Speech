@@ -25,7 +25,7 @@ The public API is intentionally close to `transcribe-rs`:
 
 ```toml
 [dependencies]
-glimpse-speech = { version = "0.1.0", features = ["whisper", "parakeet"] }
+glimpse-speech = { git = "https://github.com/LegendarySpy/Glimpse-Speech.git", tag = "0.1.0", features = ["whisper", "parakeet"] }
 ```
 
 For local development in this repository:

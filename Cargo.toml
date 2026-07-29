@@ -1,9 +1,9 @@
 [package]
 name = "glimpse-speech"
-version = "1.5.1"
+version = "1.5.2"
 edition = "2021"
 resolver = "3"
-rust-version = "1.85"
+rust-version = "1.88"
 autoexamples = false
 description = "A transcription API powered by whisper-rs and NVIDIA speech models via parakeet-rs"
 license = "MIT"
@@ -26,7 +26,7 @@ cli = ["api", "dep:clap", "dep:directories"]
 [dependencies]
 anyhow = "1"
 axum = { version = "0.8", features = ["multipart"], optional = true }
-base64 = { version = "0.22", optional = true }
+base64 = { version = "0.23", optional = true }
 clap = { version = "4.5", features = ["derive"], optional = true }
 directories = { version = "6", optional = true }
 flacenc = { version = "0.5", default-features = false, optional = true }
@@ -69,8 +69,8 @@ whisper-rs = { version = "0.16.0", features = ["vulkan", "raw-api"], optional = 
 # Intel Mac excluded: ort has no prebuilt onnxruntime there (Silero VAD falls
 # back to keeping all speech, see vad.rs) and parakeet models don't run on it.
 [target.'cfg(not(all(target_os = "macos", target_arch = "x86_64")))'.dependencies]
-parakeet-rs = { version = "0.3.6", optional = true }
-ort = { version = "=2.0.0-rc.12", optional = true }
+parakeet-rs = { version = "0.3.7", optional = true }
+ort = { version = "=2.0.0-rc.13", optional = true }
 
 [[example]]
 name = "cleanup"

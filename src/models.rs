@@ -188,22 +188,20 @@ impl ModelInstallManager {
                 if !crate::engines::apple::available() {
                     return Err(anyhow!("Apple speech requires macOS 26 or later"));
                 }
+                return Ok(ResolvedModel {
+                    id: spec.id.clone(),
+                    path: PathBuf::new(),
+                    engine: spec.engine,
+                    layout: default_layout(spec.engine, spec.variant.as_deref()),
+                    variant: spec.variant.clone(),
+                });
             }
             #[cfg(not(all(
                 feature = "apple-speech",
                 target_os = "macos",
                 target_arch = "aarch64"
             )))]
-            {
-                return Err(anyhow!("Apple speech support is not enabled on this build"));
-            }
-            return Ok(ResolvedModel {
-                id: spec.id.clone(),
-                path: PathBuf::new(),
-                engine: spec.engine,
-                layout: default_layout(spec.engine, spec.variant.as_deref()),
-                variant: spec.variant.clone(),
-            });
+            return Err(anyhow!("Apple speech support is not enabled on this build"));
         }
         if spec.engine != ModelEngine::Whisper {
             let status = self.status(spec)?;
@@ -239,22 +237,20 @@ impl ModelInstallManager {
                 if !crate::engines::apple::available() {
                     return Err(anyhow!("Apple speech requires macOS 26 or later"));
                 }
+                return Ok(ResolvedModel {
+                    id: reference.to_string(),
+                    path: PathBuf::new(),
+                    engine,
+                    layout: default_layout(engine, None),
+                    variant: None,
+                });
             }
             #[cfg(not(all(
                 feature = "apple-speech",
                 target_os = "macos",
                 target_arch = "aarch64"
             )))]
-            {
-                return Err(anyhow!("Apple speech support is not enabled on this build"));
-            }
-            return Ok(ResolvedModel {
-                id: reference.to_string(),
-                path: PathBuf::new(),
-                engine,
-                layout: default_layout(engine, None),
-                variant: None,
-            });
+            return Err(anyhow!("Apple speech support is not enabled on this build"));
         }
         let path = match engine {
             ModelEngine::Whisper => [PathBuf::from(reference), self.cache_dir.join(reference)]

@@ -35,7 +35,11 @@ mod silero {
 
     impl SileroVad {
         fn new() -> Result<Self> {
+            // One thread beats the default pool here: the per-frame graph is so
+            // small that thread hand-off costs more than the work it splits.
             let session = Session::builder()?
+                .with_intra_threads(1)
+                .unwrap_or_else(|error| error.recover())
                 .commit_from_memory(MODEL)
                 .context("load silero vad model")?;
             Ok(Self {

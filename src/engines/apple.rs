@@ -3,7 +3,7 @@
 //! to download or load from disk.
 
 use std::error::Error;
-use std::ffi::{c_char, CStr, CString};
+use std::ffi::{CStr, CString, c_char};
 use std::path::Path;
 
 use serde::Deserialize;
@@ -131,16 +131,14 @@ impl AppleEngine {
     pub fn transcribe_chunk(&mut self, chunk: &[f32]) -> Result<(), Box<dyn Error>> {
         let handle = match self.stream {
             Some(handle) => handle,
-            None => {
-                let handle = start_session(
+            None => *self.stream.insert(
+                start_session(
                     self.stream_language.as_deref(),
                     false,
                     &self.stream_dictionary,
                 )
-                .ok_or("failed to start apple speech session")?;
-                self.stream = Some(handle);
-                handle
-            }
+                .ok_or("failed to start apple speech session")?,
+            ),
         };
         let status = unsafe { gs_apple_stream_feed(handle, chunk.as_ptr(), chunk.len()) };
         if status != 0 {
@@ -150,12 +148,9 @@ impl AppleEngine {
     }
 
     pub fn get_transcript(&self) -> String {
-        match self.stream {
-            Some(handle) => {
-                take_string(unsafe { gs_apple_stream_text(handle) }).unwrap_or_default()
-            }
-            None => String::new(),
-        }
+        self.stream
+            .and_then(|handle| take_string(unsafe { gs_apple_stream_text(handle) }))
+            .unwrap_or_default()
     }
 
     /// Ends the stream and returns the fully finalized transcript.
@@ -227,11 +222,7 @@ impl TranscriptionEngine for AppleEngine {
             .collect();
         Ok(TranscriptionResult {
             text: parsed.text,
-            segments: if segments.is_empty() {
-                None
-            } else {
-                Some(segments)
-            },
+            segments: (!segments.is_empty()).then_some(segments),
             words: None,
             language,
         })

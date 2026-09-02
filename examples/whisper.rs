@@ -1,23 +1,17 @@
 use std::path::PathBuf;
 
 use glimpse_speech::{
-    engines::whisper::{WhisperEngine, WhisperInferenceParams},
     TranscriptionEngine,
+    engines::whisper::{WhisperEngine, WhisperInferenceParams},
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
-
     let model_path = PathBuf::from(
         args.get(1)
-            .map(|value| value.as_str())
-            .unwrap_or("models/whisper-medium-q4_1.bin"),
+            .map_or("models/whisper-medium-q4_1.bin", String::as_str),
     );
-    let wav_path = PathBuf::from(
-        args.get(2)
-            .map(|value| value.as_str())
-            .unwrap_or("samples/dots.wav"),
-    );
+    let wav_path = PathBuf::from(args.get(2).map_or("samples/dots.wav", String::as_str));
 
     let mut engine = WhisperEngine::new();
     engine.load_model(&model_path)?;
@@ -31,14 +25,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     println!("{}", result.text);
-
-    if let Some(segments) = result.segments {
-        for segment in segments {
-            println!(
-                "[{:.2}s - {:.2}s] {}",
-                segment.start, segment.end, segment.text
-            );
-        }
+    for segment in result.segments.unwrap_or_default() {
+        println!(
+            "[{:.2}s - {:.2}s] {}",
+            segment.start, segment.end, segment.text
+        );
     }
 
     Ok(())

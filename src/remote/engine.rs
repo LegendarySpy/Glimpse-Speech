@@ -4,17 +4,17 @@ use std::{
 };
 
 use base64::Engine as _;
-use reqwest::{header::RETRY_AFTER, multipart, Client};
+use reqwest::{Client, header::RETRY_AFTER, multipart};
 use serde::{Deserialize, Serialize};
 use tokio_util::io::ReaderStream;
 
 use super::provider::{
-    apply_auth, build_transcription_form, is_self_hosted_host, plan_request, resolve_profile,
-    AudioRequest, DurationSource, EndpointProfile, TranscriptionFormParams,
+    AudioRequest, DurationSource, EndpointProfile, TranscriptionFormParams, apply_auth,
+    build_transcription_form, is_self_hosted_host, plan_request, resolve_profile,
 };
 use super::{
-    config_error, parse_retry_after, parse_upstream_error, transport_error, RemoteError,
-    RemoteErrorKind, ResponseFormat,
+    RemoteError, RemoteErrorKind, ResponseFormat, config_error, parse_retry_after,
+    parse_upstream_error, transport_error,
 };
 use crate::{TimestampGranularity, Transcription};
 
@@ -435,9 +435,7 @@ fn parse_transcription_body(
             words,
             model_id: model.to_string(),
             language: parsed.language,
-            duration_ms: duration_seconds
-                .map(|seconds| (seconds.max(0.0) * 1000.0) as u128)
-                .unwrap_or(0),
+            duration_ms: duration_seconds.map_or(0, |seconds| (seconds.max(0.0) * 1000.0) as u128),
         },
         segments: diarized_segments,
     })
@@ -469,10 +467,10 @@ fn map_diarized_text(items: &[UpstreamSegment]) -> Vec<DiarizedSegment> {
 }
 
 fn upstream_segment_text(item: &UpstreamSegment) -> String {
-    if !item.text.is_empty() {
-        item.text.clone()
-    } else {
+    if item.text.is_empty() {
         item.word.clone()
+    } else {
+        item.text.clone()
     }
 }
 
@@ -611,13 +609,13 @@ fn audio_mime_for_extension(extension: Option<&str>) -> &'static str {
     match extension {
         Some("wav") => "audio/wav",
         Some("mp3") => "audio/mpeg",
-        Some("m4a") | Some("mp4") => "audio/mp4",
+        Some("m4a" | "mp4") => "audio/mp4",
         Some("aac") => "audio/aac",
         Some("flac") => "audio/flac",
-        Some("ogg") | Some("oga") => "audio/ogg",
+        Some("ogg" | "oga") => "audio/ogg",
         Some("opus") => "audio/opus",
         Some("webm") => "audio/webm",
-        Some("mpga") | Some("mpeg") => "audio/mpeg",
+        Some("mpga" | "mpeg") => "audio/mpeg",
         _ => "application/octet-stream",
     }
 }

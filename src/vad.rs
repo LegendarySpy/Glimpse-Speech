@@ -2,15 +2,15 @@
 // implementation is gated off that target; there `speech_regions` returns None
 // and callers keep all detected speech.
 
-#[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+#[cfg(onnx_runtime)]
 pub use silero::speech_regions;
 
-#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+#[cfg(not(onnx_runtime))]
 pub fn speech_regions(_samples: &[i16], _sample_rate: u32) -> Option<Vec<(f32, f32)>> {
     None
 }
 
-#[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+#[cfg(onnx_runtime)]
 mod silero {
     use std::sync::Mutex;
 
@@ -21,6 +21,7 @@ mod silero {
     const MODEL: &[u8] = include_bytes!("silero_vad_16k_op15.onnx");
     const WINDOW: usize = 512;
     const CONTEXT: usize = 64;
+    const STATE_LEN: usize = 2 * 128;
     const SPEECH_THRESHOLD: f32 = 0.5;
     const FRAME_S: f32 = WINDOW as f32 / 16_000.0; // 32 ms
     const BRIDGE_FRAMES: usize = 4; // merge speech across silence gaps up to ~128 ms
@@ -44,7 +45,7 @@ mod silero {
                 .context("load silero vad model")?;
             Ok(Self {
                 session,
-                state: vec![0.0; 2 * 128],
+                state: vec![0.0; STATE_LEN],
                 context: vec![0.0; CONTEXT],
                 input: vec![0.0; CONTEXT + WINDOW],
             })
@@ -82,9 +83,7 @@ mod silero {
         let mut gap = 0usize;
         for (i, &speech) in mask.iter().enumerate() {
             if speech {
-                if start.is_none() {
-                    start = Some(i);
-                }
+                start.get_or_insert(i);
                 gap = 0;
             } else if let Some(s) = start {
                 gap += 1;
@@ -120,10 +119,35 @@ mod silero {
             return Some(Vec::new());
         }
         let mut guard = VAD.lock().ok()?;
-        if guard.is_none() {
-            *guard = Some(SileroVad::new().ok()?);
-        }
-        let mask = guard.as_mut().unwrap().frame_mask(&audio).ok()?;
+        let vad = match guard.as_mut() {
+            Some(vad) => vad,
+            None => guard.insert(SileroVad::new().ok()?),
+        };
+        let mask = vad.frame_mask(&audio).ok()?;
         Some(mask_to_regions(&mask))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{BRIDGE_FRAMES, FRAME_S, PAD_S, mask_to_regions};
+
+        #[test]
+        fn bridges_short_gaps_and_pads_regions() {
+            let mut mask = vec![true; 10];
+            mask.extend(std::iter::repeat_n(false, BRIDGE_FRAMES));
+            mask.extend(std::iter::repeat_n(true, 5));
+            mask.extend(std::iter::repeat_n(false, BRIDGE_FRAMES + 2));
+            mask.extend(std::iter::repeat_n(true, 3));
+
+            let regions = mask_to_regions(&mask);
+            assert_eq!(regions.len(), 2);
+            assert_eq!(regions[0].0, 0.0);
+            assert!((regions[0].1 - (19.0 * FRAME_S + PAD_S)).abs() < 1e-6);
+        }
+
+        #[test]
+        fn silence_yields_no_regions() {
+            assert!(mask_to_regions(&[false; 20]).is_empty());
+        }
     }
 }

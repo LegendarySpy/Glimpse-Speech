@@ -22,11 +22,7 @@ pub enum AppleAvailability {
 
 enum Backend {
     Off,
-    #[cfg(all(
-        feature = "cleanup-apple",
-        target_os = "macos",
-        target_arch = "aarch64"
-    ))]
+    #[cfg(apple_cleanup)]
     Apple,
 }
 
@@ -41,21 +37,13 @@ impl CleanupProvider {
     /// on supported builds availability is still checked per call (the user
     /// can toggle Apple Intelligence at any time).
     pub fn apple() -> Self {
-        #[cfg(all(
-            feature = "cleanup-apple",
-            target_os = "macos",
-            target_arch = "aarch64"
-        ))]
+        #[cfg(apple_cleanup)]
         {
             Self {
                 backend: Backend::Apple,
             }
         }
-        #[cfg(not(all(
-            feature = "cleanup-apple",
-            target_os = "macos",
-            target_arch = "aarch64"
-        )))]
+        #[cfg(not(apple_cleanup))]
         {
             Self::off()
         }
@@ -63,83 +51,47 @@ impl CleanupProvider {
 
     /// Whether the Apple backend can run right now. For settings UI.
     pub fn apple_availability() -> AppleAvailability {
-        #[cfg(all(
-            feature = "cleanup-apple",
-            target_os = "macos",
-            target_arch = "aarch64"
-        ))]
+        #[cfg(apple_cleanup)]
         {
             apple::availability()
         }
-        #[cfg(not(all(
-            feature = "cleanup-apple",
-            target_os = "macos",
-            target_arch = "aarch64"
-        )))]
+        #[cfg(not(apple_cleanup))]
         {
             AppleAvailability::Unsupported
         }
     }
 
     pub async fn apply(&self, transcription: Transcription) -> Transcription {
-        match &self.backend {
+        match self.backend {
             Backend::Off => transcription,
-            #[cfg(all(
-                feature = "cleanup-apple",
-                target_os = "macos",
-                target_arch = "aarch64"
-            ))]
+            #[cfg(apple_cleanup)]
             Backend::Apple => apply_apple(transcription).await,
         }
     }
 }
 
 /// Inputs longer than this skip cleanup (on-device model context is ~8k tokens).
-#[cfg(all(
-    feature = "cleanup-apple",
-    target_os = "macos",
-    target_arch = "aarch64"
-))]
+#[cfg(apple_cleanup)]
 const MAX_INPUT_CHARS: usize = 12_000;
 
-#[cfg(all(
-    feature = "cleanup-apple",
-    target_os = "macos",
-    target_arch = "aarch64"
-))]
+#[cfg(apple_cleanup)]
 async fn apply_apple(mut transcription: Transcription) -> Transcription {
     let text = transcription.text.trim().to_string();
     if text.is_empty() || text.len() > MAX_INPUT_CHARS {
         return transcription;
     }
 
-    let result = tokio::task::spawn_blocking(move || apple::clean(&text)).await;
-    match result {
-        Ok(Ok(cleaned)) if accept(&transcription.text, &cleaned) => {
-            transcription.text = cleaned;
-            transcription
-        }
-        Ok(Ok(_)) => {
-            tracing::debug!("cleanup output rejected by sanity check, keeping original");
-            transcription
-        }
-        Ok(Err(err)) => {
-            tracing::debug!("cleanup unavailable or failed: {err}");
-            transcription
-        }
-        Err(err) => {
-            tracing::debug!("cleanup task failed: {err}");
-            transcription
-        }
+    match tokio::task::spawn_blocking(move || apple::clean(&text)).await {
+        Ok(Ok(cleaned)) if accept(&transcription.text, &cleaned) => transcription.text = cleaned,
+        Ok(Ok(_)) => tracing::debug!("cleanup output rejected by sanity check, keeping original"),
+        Ok(Err(err)) => tracing::debug!("cleanup unavailable or failed: {err}"),
+        Err(err) => tracing::debug!("cleanup task failed: {err}"),
     }
+    transcription
 }
 
 /// Reject outputs that look like the model did more than tidy the text.
-#[cfg(all(
-    feature = "cleanup-apple",
-    target_os = "macos",
-    target_arch = "aarch64"
-))]
+#[cfg(apple_cleanup)]
 fn accept(original: &str, cleaned: &str) -> bool {
     let cleaned = cleaned.trim();
     if cleaned.is_empty() {
@@ -149,14 +101,12 @@ fn accept(original: &str, cleaned: &str) -> bool {
     cleaned.len() <= original_len.saturating_mul(3) / 2 + 32
 }
 
-#[cfg(all(
-    feature = "cleanup-apple",
-    target_os = "macos",
-    target_arch = "aarch64"
-))]
+#[cfg(apple_cleanup)]
 mod apple {
-    use anyhow::{anyhow, Context};
-    use fm_rs::{GenerationOptions, Session, SystemLanguageModel};
+    use anyhow::{Context, anyhow};
+    use fm_rs::{GenerationOptions, ModelAvailability, Session, SystemLanguageModel};
+
+    use super::AppleAvailability;
 
     const INSTRUCTIONS: &str = "\
 <task>
@@ -180,9 +130,7 @@ Clean up raw speech-to-text output.
         })
     }
 
-    pub fn availability() -> super::AppleAvailability {
-        use super::AppleAvailability;
-        use fm_rs::ModelAvailability;
+    pub fn availability() -> AppleAvailability {
         if !os_supports_foundation_models() {
             return AppleAvailability::Unsupported;
         }
@@ -233,19 +181,11 @@ pub fn apple_generate(
     temperature: f32,
     max_response_tokens: Option<u32>,
 ) -> anyhow::Result<String> {
-    #[cfg(all(
-        feature = "cleanup-apple",
-        target_os = "macos",
-        target_arch = "aarch64"
-    ))]
+    #[cfg(apple_cleanup)]
     {
         apple::generate(instructions, prompt, temperature, max_response_tokens)
     }
-    #[cfg(not(all(
-        feature = "cleanup-apple",
-        target_os = "macos",
-        target_arch = "aarch64"
-    )))]
+    #[cfg(not(apple_cleanup))]
     {
         Err(anyhow::anyhow!(
             "on-device model is not supported in this build"

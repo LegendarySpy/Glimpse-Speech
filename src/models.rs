@@ -7,8 +7,8 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{anyhow, Context, Result};
-use reqwest::{header::RANGE, Client, StatusCode};
+use anyhow::{Context, Result, anyhow};
+use reqwest::{Client, StatusCode, header::RANGE};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
@@ -23,22 +23,31 @@ const PROGRESS_EMIT_STEP_BYTES: u64 = 1024 * 1024;
 static MODEL_DOWNLOAD_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
 #[serde(rename_all = "snake_case")]
 pub enum ModelEngine {
     Whisper,
     Parakeet,
     Nemotron,
+    /// Built into macOS 26; not selectable as a loose CLI engine.
+    #[cfg_attr(feature = "cli", value(skip))]
     Apple,
+}
+
+impl ModelEngine {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Whisper => "whisper",
+            Self::Parakeet => "parakeet",
+            Self::Nemotron => "nemotron",
+            Self::Apple => "apple",
+        }
+    }
 }
 
 impl fmt::Display for ModelEngine {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ModelEngine::Whisper => write!(f, "whisper"),
-            ModelEngine::Parakeet => write!(f, "parakeet"),
-            ModelEngine::Nemotron => write!(f, "nemotron"),
-            ModelEngine::Apple => write!(f, "apple"),
-        }
+        f.write_str(self.as_str())
     }
 }
 
@@ -183,25 +192,7 @@ impl ModelInstallManager {
     pub fn resolve(&self, spec: &InstallSpec) -> Result<ResolvedModel> {
         validate_spec(spec)?;
         if spec.engine == ModelEngine::Apple {
-            #[cfg(all(feature = "apple-speech", target_os = "macos", target_arch = "aarch64"))]
-            {
-                if !crate::engines::apple::available() {
-                    return Err(anyhow!("Apple speech requires macOS 26 or later"));
-                }
-                return Ok(ResolvedModel {
-                    id: spec.id.clone(),
-                    path: PathBuf::new(),
-                    engine: spec.engine,
-                    layout: default_layout(spec.engine, spec.variant.as_deref()),
-                    variant: spec.variant.clone(),
-                });
-            }
-            #[cfg(not(all(
-                feature = "apple-speech",
-                target_os = "macos",
-                target_arch = "aarch64"
-            )))]
-            return Err(anyhow!("Apple speech support is not enabled on this build"));
+            return resolve_apple(&spec.id, spec.variant.as_deref());
         }
         if spec.engine != ModelEngine::Whisper {
             let status = self.status(spec)?;
@@ -232,25 +223,7 @@ impl ModelInstallManager {
         // inferred from the model id; `fallback_engine` covers ids with no marker.
         let engine = infer_engine(reference).unwrap_or(fallback_engine);
         if engine == ModelEngine::Apple {
-            #[cfg(all(feature = "apple-speech", target_os = "macos", target_arch = "aarch64"))]
-            {
-                if !crate::engines::apple::available() {
-                    return Err(anyhow!("Apple speech requires macOS 26 or later"));
-                }
-                return Ok(ResolvedModel {
-                    id: reference.to_string(),
-                    path: PathBuf::new(),
-                    engine,
-                    layout: default_layout(engine, None),
-                    variant: None,
-                });
-            }
-            #[cfg(not(all(
-                feature = "apple-speech",
-                target_os = "macos",
-                target_arch = "aarch64"
-            )))]
-            return Err(anyhow!("Apple speech support is not enabled on this build"));
+            return resolve_apple(reference, None);
         }
         let path = match engine {
             ModelEngine::Whisper => [PathBuf::from(reference), self.cache_dir.join(reference)]
@@ -576,6 +549,28 @@ impl ModelInstallManager {
     }
 }
 
+/// The OS owns the Apple model, so resolution only checks runtime support.
+#[cfg_attr(not(apple_speech_engine), allow(unused_variables))]
+fn resolve_apple(id: &str, variant: Option<&str>) -> Result<ResolvedModel> {
+    #[cfg(apple_speech_engine)]
+    {
+        if !crate::engines::apple::available() {
+            return Err(anyhow!("Apple speech requires macOS 26 or later"));
+        }
+        Ok(ResolvedModel {
+            id: id.to_string(),
+            path: PathBuf::new(),
+            engine: ModelEngine::Apple,
+            layout: default_layout(ModelEngine::Apple, variant),
+            variant: variant.map(str::to_string),
+        })
+    }
+    #[cfg(not(apple_speech_engine))]
+    {
+        Err(anyhow!("Apple speech support is not enabled on this build"))
+    }
+}
+
 fn spec_layout(spec: &InstallSpec) -> ModelLayout {
     spec.layout
         .unwrap_or_else(|| default_layout(spec.engine, spec.variant.as_deref()))
@@ -584,18 +579,17 @@ fn spec_layout(spec: &InstallSpec) -> ModelLayout {
 /// Best-effort engine guess from a model id, for the loose CLI path where no
 /// catalog spec names the engine. `None` when the id carries no known marker.
 pub fn infer_engine(reference: &str) -> Option<ModelEngine> {
+    const MARKERS: [ModelEngine; 4] = [
+        ModelEngine::Apple,
+        ModelEngine::Nemotron,
+        ModelEngine::Parakeet,
+        ModelEngine::Whisper,
+    ];
+
     let lower = reference.to_ascii_lowercase();
-    if lower.contains("apple") {
-        Some(ModelEngine::Apple)
-    } else if lower.contains("nemotron") {
-        Some(ModelEngine::Nemotron)
-    } else if lower.contains("parakeet") {
-        Some(ModelEngine::Parakeet)
-    } else if lower.contains("whisper") {
-        Some(ModelEngine::Whisper)
-    } else {
-        None
-    }
+    MARKERS
+        .into_iter()
+        .find(|engine| lower.contains(engine.as_str()))
 }
 
 fn default_layout(engine: ModelEngine, variant: Option<&str>) -> ModelLayout {
@@ -703,13 +697,8 @@ fn status_from_spec(dir: &Path, spec: &InstallSpec) -> ModelStatus {
 fn missing_files(dir: &Path, spec: &InstallSpec) -> Vec<String> {
     spec.files
         .iter()
-        .filter_map(|file| {
-            if file_ready(dir, file) {
-                None
-            } else {
-                Some(file.path.clone())
-            }
-        })
+        .filter(|file| !file_ready(dir, file))
+        .map(|file| file.path.clone())
         .collect()
 }
 
@@ -781,16 +770,14 @@ fn extract_archive(
         }
     }
 
-    if !sha_verified {
-        if let Some(expected_sha256) = &file.sha256 {
-            let actual = sha256_file(zip_path)?;
-            if !actual.eq_ignore_ascii_case(expected_sha256) {
-                cleanup_zip();
-                return Err(anyhow!(
-                    "{} archive has unexpected sha256: expected {expected_sha256}, got {actual}",
-                    file.path
-                ));
-            }
+    if !sha_verified && let Some(expected_sha256) = &file.sha256 {
+        let actual = sha256_file(zip_path)?;
+        if !actual.eq_ignore_ascii_case(expected_sha256) {
+            cleanup_zip();
+            return Err(anyhow!(
+                "{} archive has unexpected sha256: expected {expected_sha256}, got {actual}",
+                file.path
+            ));
         }
     }
 
@@ -1025,13 +1012,14 @@ fn sha256_file(path: &Path) -> io::Result<String> {
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    out
+    use std::fmt::Write as _;
+
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut out, byte| {
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
 }
 
 fn can_retry(retries: &mut usize) -> bool {
@@ -1048,8 +1036,7 @@ fn is_cancelled(options: &InstallOptions<'_>) -> bool {
     options
         .cancel_token
         .as_ref()
-        .map(|token| token.is_cancelled())
-        .unwrap_or(false)
+        .is_some_and(CancellationToken::is_cancelled)
 }
 
 fn emit_progress(
@@ -1064,7 +1051,7 @@ fn emit_progress(
     };
 
     let percent = if total > 0 {
-        ((downloaded as f64 / total as f64) * 100.0).clamp(0.0, 100.0)
+        (downloaded as f64 / total as f64 * 100.0).clamp(0.0, 100.0)
     } else {
         0.0
     };
@@ -1153,6 +1140,21 @@ mod tests {
     }
 
     #[test]
+    fn infers_engine_from_model_id_markers() {
+        assert_eq!(infer_engine("Whisper-large-v3"), Some(ModelEngine::Whisper));
+        assert_eq!(
+            infer_engine("parakeet-tdt-int8"),
+            Some(ModelEngine::Parakeet)
+        );
+        assert_eq!(
+            infer_engine("nemotron_streaming_en"),
+            Some(ModelEngine::Nemotron)
+        );
+        assert_eq!(infer_engine("apple"), Some(ModelEngine::Apple));
+        assert_eq!(infer_engine("ggml-turbo.bin"), None);
+    }
+
+    #[test]
     fn rejects_unsafe_model_ids() {
         let root =
             std::env::temp_dir().join(format!("glimpse-speech-unsafe-id-{}", std::process::id()));
@@ -1198,11 +1200,13 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(fs::read(&target).unwrap(), b"old");
-        assert!(fs::read_dir(&root).unwrap().all(|entry| !entry
-            .unwrap()
-            .file_name()
-            .to_string_lossy()
-            .contains(".backup-")));
+        assert!(fs::read_dir(&root).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".backup-")
+        }));
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -1258,12 +1262,16 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let manager = ModelInstallManager::new(&root);
 
-        assert!(manager
-            .resolve_loose("totally-unknown", ModelEngine::Whisper)
-            .is_err());
-        assert!(manager
-            .resolve_loose("/no/such/file/model.bin", ModelEngine::Whisper)
-            .is_err());
+        assert!(
+            manager
+                .resolve_loose("totally-unknown", ModelEngine::Whisper)
+                .is_err()
+        );
+        assert!(
+            manager
+                .resolve_loose("/no/such/file/model.bin", ModelEngine::Whisper)
+                .is_err()
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -1317,9 +1325,11 @@ mod tests {
         let model_path = root.join("model.bin");
         fs::write(&model_path, b"not a directory").unwrap();
 
-        assert!(manager
-            .resolve_loose(model_path.to_str().unwrap(), ModelEngine::Parakeet)
-            .is_err());
+        assert!(
+            manager
+                .resolve_loose(model_path.to_str().unwrap(), ModelEngine::Parakeet)
+                .is_err()
+        );
 
         let _ = fs::remove_dir_all(&root);
     }

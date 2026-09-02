@@ -1,5 +1,5 @@
-use glimpse_speech::cleanup::CleanupProvider;
 use glimpse_speech::Transcription;
+use glimpse_speech::cleanup::CleanupProvider;
 
 #[tokio::main]
 async fn main() {

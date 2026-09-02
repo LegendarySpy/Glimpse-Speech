@@ -1,33 +1,18 @@
-#[cfg(all(feature = "apple-speech", target_os = "macos", target_arch = "aarch64"))]
+#[cfg(apple_speech_engine)]
 pub mod apple;
-#[cfg(all(
-    feature = "nvidia",
-    not(all(target_os = "macos", target_arch = "x86_64"))
-))]
+#[cfg(nvidia_engines)]
 pub mod nemotron;
-#[cfg(all(
-    feature = "nvidia",
-    not(all(target_os = "macos", target_arch = "x86_64"))
-))]
+#[cfg(nvidia_engines)]
 pub mod parakeet;
 #[cfg(feature = "whisper")]
 pub mod whisper;
 
-#[cfg(any(
-    feature = "whisper",
-    all(
-        feature = "nvidia",
-        not(all(target_os = "macos", target_arch = "x86_64"))
-    )
-))]
+#[cfg(any(feature = "whisper", nvidia_engines))]
 pub(crate) fn io_error(message: impl Into<String>) -> Box<dyn std::error::Error> {
     std::io::Error::other(message.into()).into()
 }
 
-#[cfg(all(
-    feature = "nvidia",
-    not(all(target_os = "macos", target_arch = "x86_64"))
-))]
+#[cfg(nvidia_engines)]
 pub(crate) fn validate_model_dir(
     model_path: &std::path::Path,
     engine: &str,
@@ -49,46 +34,32 @@ pub(crate) fn validate_model_dir(
 
 /// Inference thread count: physical parallelism, capped where extra threads
 /// stop paying for themselves on hybrid-core CPUs.
-#[cfg(any(
-    feature = "whisper",
-    all(
-        feature = "nvidia",
-        not(all(target_os = "macos", target_arch = "x86_64"))
-    )
-))]
+#[cfg(any(feature = "whisper", nvidia_engines))]
 pub(crate) fn inference_threads() -> usize {
+    const MAX_THREADS: usize = 8;
+
     #[cfg(target_os = "macos")]
     if let Some(performance_cores) = macos_performance_cores() {
-        return performance_cores.min(8);
+        return performance_cores.min(MAX_THREADS);
     }
 
     std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .min(8)
+        .map_or(4, |n| n.get())
+        .min(MAX_THREADS)
 }
 
 /// Performance-core count on hybrid Apple Silicon. Evenly-partitioned
 /// parallel ops stall on efficiency cores, so threads beyond the P-core
 /// count hurt more than they help. Absent on Intel Macs (falls back).
-#[cfg(all(
-    target_os = "macos",
-    any(
-        feature = "whisper",
-        all(
-            feature = "nvidia",
-            not(all(target_os = "macos", target_arch = "x86_64"))
-        )
-    )
-))]
+#[cfg(all(target_os = "macos", any(feature = "whisper", nvidia_engines)))]
 fn macos_performance_cores() -> Option<usize> {
     let mut value: libc::c_int = 0;
     let mut size = std::mem::size_of::<libc::c_int>();
     let result = unsafe {
         libc::sysctlbyname(
             c"hw.perflevel0.physicalcpu".as_ptr(),
-            &mut value as *mut libc::c_int as *mut libc::c_void,
-            &mut size,
+            (&raw mut value).cast::<libc::c_void>(),
+            &raw mut size,
             std::ptr::null_mut(),
             0,
         )
@@ -96,11 +67,7 @@ fn macos_performance_cores() -> Option<usize> {
     (result == 0 && value > 0).then_some(value as usize)
 }
 
-#[cfg(all(
-    test,
-    feature = "nvidia",
-    not(all(target_os = "macos", target_arch = "x86_64"))
-))]
+#[cfg(all(test, nvidia_engines))]
 mod tests {
     use super::validate_model_dir;
 

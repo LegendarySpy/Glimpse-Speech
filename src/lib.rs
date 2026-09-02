@@ -27,12 +27,15 @@ pub(crate) fn silence_native_logs() {}
 
 #[cfg(feature = "whisper")]
 mod native_log {
-    use std::ffi::{c_char, c_void, CStr};
+    use std::collections::VecDeque;
+    use std::ffi::{CStr, c_char, c_void};
     use std::sync::Mutex;
 
     use whisper_rs::whisper_rs_sys;
 
-    static CORE_ML_LINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    const MAX_LINES: usize = 64;
+
+    static CORE_ML_LINES: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
 
     unsafe extern "C" fn capture(
         _level: whisper_rs_sys::ggml_log_level,
@@ -45,10 +48,10 @@ mod native_log {
         let message = unsafe { CStr::from_ptr(text) }.to_string_lossy();
         if message.contains("Core ML") {
             let mut lines = CORE_ML_LINES.lock().unwrap();
-            if lines.len() >= 64 {
-                lines.remove(0);
+            if lines.len() >= MAX_LINES {
+                lines.pop_front();
             }
-            lines.push(message.trim().to_string());
+            lines.push_back(message.trim().to_string());
         }
     }
 
@@ -60,7 +63,7 @@ mod native_log {
     }
 
     pub(crate) fn take_lines() -> Vec<String> {
-        std::mem::take(&mut *CORE_ML_LINES.lock().unwrap())
+        CORE_ML_LINES.lock().unwrap().drain(..).collect()
     }
 }
 
@@ -108,6 +111,39 @@ pub enum TimestampGranularity {
     Segment,
     Word,
 }
+
+impl TimestampGranularity {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Segment => "segment",
+            Self::Word => "word",
+        }
+    }
+}
+
+impl std::str::FromStr for TimestampGranularity {
+    type Err = UnsupportedValue;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "segment" => Ok(Self::Segment),
+            "word" => Ok(Self::Word),
+            other => Err(UnsupportedValue(other.to_string())),
+        }
+    }
+}
+
+/// A string that does not name any variant of the enum being parsed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsupportedValue(pub String);
+
+impl std::fmt::Display for UnsupportedValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "`{}`", self.0)
+    }
+}
+
+impl std::error::Error for UnsupportedValue {}
 
 pub trait TranscriptionEngine {
     type InferenceParams;

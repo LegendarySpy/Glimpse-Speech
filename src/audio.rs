@@ -16,7 +16,6 @@ pub fn read_wav_samples(wav_path: &Path) -> Result<Vec<f32>, Box<dyn std::error:
     if spec.channels != 1 {
         return Err(format!("Expected 1 channel, found {}", spec.channels).into());
     }
-
     if spec.sample_rate != 16_000 {
         return Err(format!(
             "Expected 16000 Hz sample rate, found {} Hz",
@@ -24,7 +23,6 @@ pub fn read_wav_samples(wav_path: &Path) -> Result<Vec<f32>, Box<dyn std::error:
         )
         .into());
     }
-
     if spec.bits_per_sample != 16 {
         return Err(format!(
             "Expected 16 bits per sample, found {}",
@@ -32,57 +30,46 @@ pub fn read_wav_samples(wav_path: &Path) -> Result<Vec<f32>, Box<dyn std::error:
         )
         .into());
     }
-
     if spec.sample_format != hound::SampleFormat::Int {
         return Err(format!("Expected Int sample format, found {:?}", spec.sample_format).into());
     }
 
     let mut samples = Vec::with_capacity(reader.len() as usize);
     for sample in reader.samples::<i16>() {
-        samples.push(sample? as f32 / PCM16_SCALE);
+        samples.push(f32::from(sample?) / PCM16_SCALE);
     }
-
     Ok(samples)
 }
 
 pub fn read_audio_samples(path: &Path) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
-    match read_wav_samples(path) {
-        Ok(samples) => Ok(samples),
-        Err(wav_error) => {
-            let ffmpeg = find_ffmpeg().ok_or_else(|| {
-                io_error(format!(
-                    "Audio must be a 16 kHz mono PCM WAV, or ffmpeg must be installed to decode {}: {wav_error}",
-                    path.display()
-                ))
-            })?;
-            let converted = temp_wav_path()?;
-            let status = Command::new(&ffmpeg)
-                .arg("-n")
-                .arg("-nostdin")
-                .arg("-loglevel")
-                .arg("error")
-                .arg("-i")
-                .arg(path)
-                .arg("-ar")
-                .arg("16000")
-                .arg("-ac")
-                .arg("1")
-                .arg("-sample_fmt")
-                .arg("s16")
-                .arg(&converted.path)
-                .status()
-                .map_err(|err| io_error(format!("Failed to run ffmpeg: {err}")))?;
+    let wav_error = match read_wav_samples(path) {
+        Ok(samples) => return Ok(samples),
+        Err(error) => error,
+    };
 
-            if !status.success() {
-                return Err(io_error(format!(
-                    "ffmpeg failed to decode {}",
-                    path.display()
-                )));
-            }
+    let ffmpeg = find_ffmpeg().ok_or_else(|| {
+        io_error(format!(
+            "Audio must be a 16 kHz mono PCM WAV, or ffmpeg must be installed to decode {}: {wav_error}",
+            path.display()
+        ))
+    })?;
+    let converted = temp_wav_path()?;
+    let status = Command::new(&ffmpeg)
+        .args(["-n", "-nostdin", "-loglevel", "error", "-i"])
+        .arg(path)
+        .args(["-ar", "16000", "-ac", "1", "-sample_fmt", "s16"])
+        .arg(&converted.path)
+        .status()
+        .map_err(|err| io_error(format!("Failed to run ffmpeg: {err}")))?;
 
-            read_wav_samples(&converted.path)
-        }
+    if !status.success() {
+        return Err(io_error(format!(
+            "ffmpeg failed to decode {}",
+            path.display()
+        )));
     }
+
+    read_wav_samples(&converted.path)
 }
 
 fn find_ffmpeg() -> Option<PathBuf> {
@@ -92,11 +79,9 @@ fn find_ffmpeg() -> Option<PathBuf> {
         "ffmpeg"
     };
 
-    std::env::var_os("PATH").and_then(|paths| {
-        std::env::split_paths(&paths)
-            .map(|path| path.join(binary))
-            .find(|candidate| candidate.is_file())
-    })
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|path| path.join(binary))
+        .find(|candidate| candidate.is_file())
 }
 
 static TEMP_DECODE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -148,55 +133,41 @@ fn io_error(message: impl Into<String>) -> Box<dyn std::error::Error> {
     io::Error::other(message.into()).into()
 }
 
-#[cfg(any(
-    feature = "whisper",
-    all(
-        feature = "nvidia",
-        not(all(target_os = "macos", target_arch = "x86_64"))
-    ),
-    all(feature = "apple-speech", target_os = "macos", target_arch = "aarch64")
-))]
+/// Converts PCM16 to normalized f32 and linearly resamples to `to_rate` in a
+/// single pass. Equal or zero rates only scale.
+#[cfg(local_engines)]
 pub(crate) fn resample_i16_to_f32(samples: &[i16], from_rate: u32, to_rate: u32) -> Vec<f32> {
     const SCALE: f32 = 1.0 / PCM16_SCALE;
+
+    let scaled = |sample: i16| f32::from(sample) * SCALE;
 
     if samples.is_empty() {
         return Vec::new();
     }
     if from_rate == 0 || to_rate == 0 || from_rate == to_rate {
-        return samples.iter().map(|&s| s as f32 * SCALE).collect();
+        return samples.iter().copied().map(scaled).collect();
     }
 
-    let step = from_rate as f64 / to_rate as f64;
-    let target_len = ((samples.len() as f64 / step).ceil().max(1.0)) as usize;
+    let step = f64::from(from_rate) / f64::from(to_rate);
+    let target_len = (samples.len() as f64 / step).ceil().max(1.0) as usize;
     let last_index = samples.len() - 1;
-    let mut output = Vec::with_capacity(target_len);
 
-    for idx in 0..target_len {
-        let src_pos = idx as f64 * step;
-        let base = src_pos as usize;
-        if base >= last_index {
-            output.push(samples[last_index] as f32 * SCALE);
-        } else {
+    (0..target_len)
+        .map(|idx| {
+            let src_pos = idx as f64 * step;
+            let base = src_pos as usize;
+            if base >= last_index {
+                return scaled(samples[last_index]);
+            }
             let frac = (src_pos - base as f64) as f32;
-            let current = samples[base] as f32 * SCALE;
-            let next = samples[base + 1] as f32 * SCALE;
-            output.push(current + (next - current) * frac);
-        }
-    }
-
-    output
+            let current = scaled(samples[base]);
+            let next = scaled(samples[base + 1]);
+            current + (next - current) * frac
+        })
+        .collect()
 }
 
-#[cfg(all(
-    test,
-    any(
-        feature = "whisper",
-        all(
-            feature = "nvidia",
-            not(all(target_os = "macos", target_arch = "x86_64"))
-        )
-    )
-))]
+#[cfg(all(test, local_engines))]
 mod resample_tests {
     use super::resample_i16_to_f32;
 
@@ -206,7 +177,7 @@ mod resample_tests {
     fn passthrough_when_rate_unchanged() {
         let input = [0i16, 16_384, -16_384, 32_767];
         let out = resample_i16_to_f32(&input, 16_000, 16_000);
-        let expected: Vec<f32> = input.iter().map(|&s| s as f32 * SCALE).collect();
+        let expected: Vec<f32> = input.iter().map(|&s| f32::from(s) * SCALE).collect();
         assert_eq!(out, expected);
     }
 

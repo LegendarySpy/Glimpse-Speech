@@ -1,26 +1,19 @@
 use std::{
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, MutexGuard},
     time::Instant,
 };
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
-#[cfg(any(
-    feature = "whisper",
-    all(
-        feature = "nvidia",
-        not(all(target_os = "macos", target_arch = "x86_64"))
-    ),
-    all(feature = "apple-speech", target_os = "macos", target_arch = "aarch64")
-))]
+#[cfg(local_engines)]
 use crate::TranscriptionEngine;
 
 use crate::{
+    TimestampGranularity, Transcription, TranscriptionResult,
     models::{
         InstallOptions, InstallSpec, ModelEngine, ModelInstallManager, ModelStatus, ResolvedModel,
     },
-    TimestampGranularity, Transcription, TranscriptionResult,
 };
 
 pub type ModelResolver = Arc<dyn Fn(&str) -> Option<InstallSpec> + Send + Sync>;
@@ -30,6 +23,7 @@ pub struct SpeechConfig {
     pub model_cache_dir: PathBuf,
     pub resolver: ModelResolver,
 }
+
 impl SpeechConfig {
     pub fn loose(model_cache_dir: PathBuf) -> Self {
         Self {
@@ -69,14 +63,7 @@ struct TranscriptionWithDuration {
     audio_duration_ms: u128,
 }
 
-#[cfg(any(
-    feature = "whisper",
-    all(
-        feature = "nvidia",
-        not(all(target_os = "macos", target_arch = "x86_64"))
-    ),
-    all(feature = "apple-speech", target_os = "macos", target_arch = "aarch64")
-))]
+#[cfg(local_engines)]
 struct PreparedAudio {
     samples: Vec<f32>,
     duration_ms: u128,
@@ -91,177 +78,105 @@ struct LoadedEngine {
 
 enum EngineInstance {
     #[cfg(feature = "whisper")]
-    Whisper {
-        engine: crate::engines::whisper::WhisperEngine,
-    },
-    #[cfg(all(
-        feature = "nvidia",
-        not(all(target_os = "macos", target_arch = "x86_64"))
-    ))]
-    Parakeet {
-        engine: crate::engines::parakeet::ParakeetEngine,
-    },
-    #[cfg(all(
-        feature = "nvidia",
-        not(all(target_os = "macos", target_arch = "x86_64"))
-    ))]
-    Nemotron {
-        engine: crate::engines::nemotron::NemotronEngine,
-    },
-    #[cfg(all(feature = "apple-speech", target_os = "macos", target_arch = "aarch64"))]
-    Apple {
-        engine: crate::engines::apple::AppleEngine,
-    },
+    Whisper(crate::engines::whisper::WhisperEngine),
+    #[cfg(nvidia_engines)]
+    Parakeet(crate::engines::parakeet::ParakeetEngine),
+    #[cfg(nvidia_engines)]
+    Nemotron(crate::engines::nemotron::NemotronEngine),
+    #[cfg(apple_speech_engine)]
+    Apple(crate::engines::apple::AppleEngine),
 }
 
+#[cfg(streaming_engines)]
 impl EngineInstance {
-    #[cfg(any(
-        all(
-            feature = "nvidia",
-            not(all(target_os = "macos", target_arch = "x86_64"))
-        ),
-        all(feature = "apple-speech", target_os = "macos", target_arch = "aarch64")
-    ))]
     fn streaming_transcribe_chunk(&mut self, chunk: &[f32]) -> Result<String> {
         match self {
-            #[cfg(all(
-                feature = "nvidia",
-                not(all(target_os = "macos", target_arch = "x86_64"))
-            ))]
-            EngineInstance::Parakeet { engine } => {
-                engine
-                    .transcribe_chunk(chunk)
-                    .map_err(|err| anyhow!(err.to_string()))?;
+            #[cfg(nvidia_engines)]
+            Self::Parakeet(engine) => {
+                engine.transcribe_chunk(chunk).map_err(boxed_error)?;
                 Ok(engine.get_transcript())
             }
-            #[cfg(all(
-                feature = "nvidia",
-                not(all(target_os = "macos", target_arch = "x86_64"))
-            ))]
-            EngineInstance::Nemotron { engine } => {
-                engine
-                    .transcribe_chunk(chunk)
-                    .map_err(|err| anyhow!(err.to_string()))?;
+            #[cfg(nvidia_engines)]
+            Self::Nemotron(engine) => {
+                engine.transcribe_chunk(chunk).map_err(boxed_error)?;
                 Ok(engine.get_transcript())
             }
-            #[cfg(all(feature = "apple-speech", target_os = "macos", target_arch = "aarch64"))]
-            EngineInstance::Apple { engine } => {
-                engine
-                    .transcribe_chunk(chunk)
-                    .map_err(|err| anyhow!(err.to_string()))?;
+            #[cfg(apple_speech_engine)]
+            Self::Apple(engine) => {
+                engine.transcribe_chunk(chunk).map_err(boxed_error)?;
                 Ok(engine.get_transcript())
             }
             #[cfg(feature = "whisper")]
-            EngineInstance::Whisper { .. } => Err(anyhow!(
+            Self::Whisper(_) => Err(anyhow!(
                 "Streaming is only supported with Apple, Nemotron, or unified Parakeet models"
             )),
         }
     }
 
-    #[cfg(any(
-        all(
-            feature = "nvidia",
-            not(all(target_os = "macos", target_arch = "x86_64"))
-        ),
-        all(feature = "apple-speech", target_os = "macos", target_arch = "aarch64")
-    ))]
     fn streaming_reset(&mut self) {
         match self {
-            #[cfg(all(
-                feature = "nvidia",
-                not(all(target_os = "macos", target_arch = "x86_64"))
-            ))]
-            EngineInstance::Parakeet { engine } => engine.reset(),
-            #[cfg(all(
-                feature = "nvidia",
-                not(all(target_os = "macos", target_arch = "x86_64"))
-            ))]
-            EngineInstance::Nemotron { engine } => engine.reset(),
-            #[cfg(all(feature = "apple-speech", target_os = "macos", target_arch = "aarch64"))]
-            EngineInstance::Apple { engine } => engine.reset(),
+            #[cfg(nvidia_engines)]
+            Self::Parakeet(engine) => engine.reset(),
+            #[cfg(nvidia_engines)]
+            Self::Nemotron(engine) => engine.reset(),
+            #[cfg(apple_speech_engine)]
+            Self::Apple(engine) => engine.reset(),
             #[cfg(feature = "whisper")]
-            EngineInstance::Whisper { .. } => {}
+            Self::Whisper(_) => {}
         }
     }
 
-    #[cfg(any(
-        all(
-            feature = "nvidia",
-            not(all(target_os = "macos", target_arch = "x86_64"))
-        ),
-        all(feature = "apple-speech", target_os = "macos", target_arch = "aarch64")
-    ))]
     fn streaming_configure(&mut self, _language: Option<String>, _dictionary: Vec<String>) {
         match self {
-            #[cfg(all(feature = "apple-speech", target_os = "macos", target_arch = "aarch64"))]
-            EngineInstance::Apple { engine } => engine.configure_stream(_language, _dictionary),
+            #[cfg(apple_speech_engine)]
+            Self::Apple(engine) => engine.configure_stream(_language, _dictionary),
             #[allow(unreachable_patterns)]
             _ => {}
         }
     }
 
-    #[cfg(any(
-        all(
-            feature = "nvidia",
-            not(all(target_os = "macos", target_arch = "x86_64"))
-        ),
-        all(feature = "apple-speech", target_os = "macos", target_arch = "aarch64")
-    ))]
     fn streaming_finalize(&mut self) -> Result<String> {
         match self {
-            #[cfg(all(feature = "apple-speech", target_os = "macos", target_arch = "aarch64"))]
-            EngineInstance::Apple { engine } => {
-                engine.finalize().map_err(|err| anyhow!(err.to_string()))
-            }
+            #[cfg(apple_speech_engine)]
+            Self::Apple(engine) => engine.finalize().map_err(boxed_error),
             #[allow(unreachable_patterns)]
             _ => Ok(self.streaming_get_transcript().unwrap_or_default()),
         }
     }
 
-    #[cfg(any(
-        all(
-            feature = "nvidia",
-            not(all(target_os = "macos", target_arch = "x86_64"))
-        ),
-        all(feature = "apple-speech", target_os = "macos", target_arch = "aarch64")
-    ))]
     fn streaming_get_transcript(&self) -> Option<String> {
         match self {
-            #[cfg(all(
-                feature = "nvidia",
-                not(all(target_os = "macos", target_arch = "x86_64"))
-            ))]
-            EngineInstance::Parakeet { engine } => Some(engine.get_transcript()),
-            #[cfg(all(
-                feature = "nvidia",
-                not(all(target_os = "macos", target_arch = "x86_64"))
-            ))]
-            EngineInstance::Nemotron { engine } => Some(engine.get_transcript()),
-            #[cfg(all(feature = "apple-speech", target_os = "macos", target_arch = "aarch64"))]
-            EngineInstance::Apple { engine } => Some(engine.get_transcript()),
+            #[cfg(nvidia_engines)]
+            Self::Parakeet(engine) => Some(engine.get_transcript()),
+            #[cfg(nvidia_engines)]
+            Self::Nemotron(engine) => Some(engine.get_transcript()),
+            #[cfg(apple_speech_engine)]
+            Self::Apple(engine) => Some(engine.get_transcript()),
             #[cfg(feature = "whisper")]
-            EngineInstance::Whisper { .. } => None,
+            Self::Whisper(_) => None,
         }
     }
 }
 
 impl SpeechService {
     pub fn new(config: SpeechConfig) -> Self {
-        crate::silence_native_logs();
-        Self {
-            model_manager: ModelInstallManager::new(config.model_cache_dir),
-            resolver: config.resolver,
-            loose_engine: ModelEngine::Whisper,
-            loaded: Mutex::new(None),
-        }
+        Self::build(
+            config.model_cache_dir,
+            config.resolver,
+            ModelEngine::Whisper,
+        )
     }
 
     pub fn new_loose_with_engine(model_cache_dir: PathBuf, engine: ModelEngine) -> Self {
+        Self::build(model_cache_dir, Arc::new(|_| None), engine)
+    }
+
+    fn build(model_cache_dir: PathBuf, resolver: ModelResolver, loose_engine: ModelEngine) -> Self {
         crate::silence_native_logs();
         Self {
             model_manager: ModelInstallManager::new(model_cache_dir),
-            resolver: Arc::new(|_| None),
-            loose_engine: engine,
+            resolver,
+            loose_engine,
             loaded: Mutex::new(None),
         }
     }
@@ -309,9 +224,7 @@ impl SpeechService {
         let lock_started = Instant::now();
         let mut guard = self.lock_loaded()?;
         let lock_wait = lock_started.elapsed();
-        let loaded = guard
-            .as_mut()
-            .ok_or_else(|| anyhow!("model did not load"))?;
+        let loaded = loaded_engine(&mut guard)?;
         let transcribe_started = Instant::now();
         let transcription = transcribe_with_engine(&mut loaded.engine, request)?;
         let transcribe_elapsed = transcribe_started.elapsed();
@@ -325,12 +238,18 @@ impl SpeechService {
             transcribe_elapsed.as_secs_f32()
         );
 
+        let TranscriptionResult {
+            text,
+            segments,
+            words,
+            language,
+        } = transcription.result;
         Ok(Transcription {
-            text: transcription.result.text,
-            segments: transcription.result.segments,
-            words: transcription.result.words,
+            text,
+            segments,
+            words,
             model_id: resolved_id,
-            language: transcription.result.language.or(requested_language),
+            language: language.or(requested_language),
             duration_ms: transcription.audio_duration_ms,
         })
     }
@@ -341,9 +260,7 @@ impl SpeechService {
         let lock_started = Instant::now();
         let mut guard = self.lock_loaded()?;
         let lock_wait = lock_started.elapsed();
-        let loaded = guard
-            .as_mut()
-            .ok_or_else(|| anyhow!("model did not load"))?;
+        let loaded = loaded_engine(&mut guard)?;
         if loaded.warmed {
             tracing::info!(
                 "[SpeechService] warm model={} skipped already_warmed total={:.2}s lock_wait={:.2}s",
@@ -356,7 +273,7 @@ impl SpeechService {
 
         let silence = vec![0.0f32; 16_000 * 2];
         let warm_started = Instant::now();
-        let _ = transcribe_with_engine(
+        transcribe_with_engine(
             &mut loaded.engine,
             TranscribeRequest {
                 audio: AudioInput::Samples16Khz(silence),
@@ -386,59 +303,38 @@ impl SpeechService {
     }
 
     pub fn is_loaded(&self) -> bool {
-        self.loaded
-            .lock()
-            .map(|guard| guard.is_some())
-            .unwrap_or(false)
+        self.loaded.lock().is_ok_and(|guard| guard.is_some())
     }
 
     pub fn loaded_model_id(&self) -> Option<String> {
         self.loaded
             .lock()
-            .ok()
-            .and_then(|guard| guard.as_ref().map(|loaded| loaded.model_id.clone()))
+            .ok()?
+            .as_ref()
+            .map(|loaded| loaded.model_id.clone())
     }
 
-    #[cfg(any(
-        all(
-            feature = "nvidia",
-            not(all(target_os = "macos", target_arch = "x86_64"))
-        ),
-        all(feature = "apple-speech", target_os = "macos", target_arch = "aarch64")
-    ))]
+    #[cfg(streaming_engines)]
     pub fn streaming_transcribe_chunk(&self, model_id: &str, chunk: &[f32]) -> Result<String> {
         self.ensure_loaded(model_id)?;
         let mut guard = self.lock_loaded()?;
-        let loaded = guard
-            .as_mut()
-            .ok_or_else(|| anyhow!("model did not load"))?;
-        loaded.engine.streaming_transcribe_chunk(chunk)
+        loaded_engine(&mut guard)?
+            .engine
+            .streaming_transcribe_chunk(chunk)
     }
 
-    #[cfg(any(
-        all(
-            feature = "nvidia",
-            not(all(target_os = "macos", target_arch = "x86_64"))
-        ),
-        all(feature = "apple-speech", target_os = "macos", target_arch = "aarch64")
-    ))]
+    #[cfg(streaming_engines)]
     pub fn streaming_reset(&self) {
-        if let Ok(mut guard) = self.loaded.lock() {
-            if let Some(loaded) = guard.as_mut() {
-                loaded.engine.streaming_reset();
-            }
+        if let Ok(mut guard) = self.loaded.lock()
+            && let Some(loaded) = guard.as_mut()
+        {
+            loaded.engine.streaming_reset();
         }
     }
 
     /// Sets language and vocabulary for the next streaming session, for
     /// engines that take per-session configuration.
-    #[cfg(any(
-        all(
-            feature = "nvidia",
-            not(all(target_os = "macos", target_arch = "x86_64"))
-        ),
-        all(feature = "apple-speech", target_os = "macos", target_arch = "aarch64")
-    ))]
+    #[cfg(streaming_engines)]
     pub fn streaming_configure(
         &self,
         model_id: &str,
@@ -448,22 +344,16 @@ impl SpeechService {
         if self.ensure_loaded(model_id).is_err() {
             return;
         }
-        if let Ok(mut guard) = self.loaded.lock() {
-            if let Some(loaded) = guard.as_mut() {
-                loaded.engine.streaming_configure(language, dictionary);
-            }
+        if let Ok(mut guard) = self.loaded.lock()
+            && let Some(loaded) = guard.as_mut()
+        {
+            loaded.engine.streaming_configure(language, dictionary);
         }
     }
 
     /// Ends the stream and returns the final transcript. Engines that
     /// finalize per chunk just return the current transcript.
-    #[cfg(any(
-        all(
-            feature = "nvidia",
-            not(all(target_os = "macos", target_arch = "x86_64"))
-        ),
-        all(feature = "apple-speech", target_os = "macos", target_arch = "aarch64")
-    ))]
+    #[cfg(streaming_engines)]
     pub fn streaming_finalize(&self) -> String {
         let Ok(mut guard) = self.loaded.lock() else {
             return String::new();
@@ -471,31 +361,18 @@ impl SpeechService {
         let Some(loaded) = guard.as_mut() else {
             return String::new();
         };
-        match loaded.engine.streaming_finalize() {
-            Ok(text) => text,
-            Err(err) => {
-                tracing::error!("[SpeechService] streaming finalize failed: {err}");
-                loaded.engine.streaming_get_transcript().unwrap_or_default()
-            }
-        }
+        loaded.engine.streaming_finalize().unwrap_or_else(|err| {
+            tracing::error!("[SpeechService] streaming finalize failed: {err}");
+            loaded.engine.streaming_get_transcript().unwrap_or_default()
+        })
     }
 
-    #[cfg(any(
-        all(
-            feature = "nvidia",
-            not(all(target_os = "macos", target_arch = "x86_64"))
-        ),
-        all(feature = "apple-speech", target_os = "macos", target_arch = "aarch64")
-    ))]
+    #[cfg(streaming_engines)]
     pub fn streaming_get_transcript(&self) -> String {
         self.loaded
             .lock()
             .ok()
-            .and_then(|guard| {
-                guard
-                    .as_ref()
-                    .and_then(|loaded| loaded.engine.streaming_get_transcript())
-            })
+            .and_then(|guard| guard.as_ref()?.engine.streaming_get_transcript())
             .unwrap_or_default()
     }
 
@@ -509,12 +386,10 @@ impl SpeechService {
         let lock_wait = lock_started.elapsed();
         let should_reload = guard
             .as_ref()
-            .map(|loaded| loaded.model_id != resolved.id || loaded.path != resolved.path)
-            .unwrap_or(true);
+            .is_none_or(|loaded| loaded.model_id != resolved.id || loaded.path != resolved.path);
 
         if should_reload {
             let load_started = Instant::now();
-            let path = resolved.path.display().to_string();
             let bytes = std::fs::metadata(&resolved.path)
                 .ok()
                 .map(|metadata| metadata.len());
@@ -522,7 +397,7 @@ impl SpeechService {
                 "[SpeechService] load start model={} engine={} path={} bytes={:?}",
                 resolved.id,
                 resolved.engine,
-                path,
+                resolved.path.display(),
                 bytes
             );
             let engine = load_engine(&resolved)?;
@@ -554,7 +429,7 @@ impl SpeechService {
         Ok(resolved.id)
     }
 
-    fn lock_loaded(&self) -> Result<std::sync::MutexGuard<'_, Option<LoadedEngine>>> {
+    fn lock_loaded(&self) -> Result<MutexGuard<'_, Option<LoadedEngine>>> {
         self.loaded
             .lock()
             .map_err(|_| anyhow!("speech service lock poisoned"))
@@ -574,51 +449,56 @@ impl Clone for SpeechService {
 
 pub type SharedSpeechService = Arc<SpeechService>;
 
-fn load_engine(resolved: &crate::models::ResolvedModel) -> Result<EngineInstance> {
+fn loaded_engine<'a>(
+    guard: &'a mut MutexGuard<'_, Option<LoadedEngine>>,
+) -> Result<&'a mut LoadedEngine> {
+    guard.as_mut().ok_or_else(|| anyhow!("model did not load"))
+}
+
+#[cfg(local_engines)]
+fn boxed_error(err: Box<dyn std::error::Error>) -> anyhow::Error {
+    anyhow!(err.to_string())
+}
+
+fn load_engine(resolved: &ResolvedModel) -> Result<EngineInstance> {
     match resolved.engine {
         ModelEngine::Whisper => {
             #[cfg(feature = "whisper")]
             {
-                use crate::engines::whisper::{dtw_preset_for_variant, WhisperModelParams};
+                use crate::engines::whisper::{
+                    WhisperEngine, WhisperModelParams, dtw_preset_for_variant,
+                };
 
-                let mut engine = crate::engines::whisper::WhisperEngine::new();
+                let mut engine = WhisperEngine::new();
                 let params = WhisperModelParams {
                     dtw_preset: resolved.variant.as_deref().and_then(dtw_preset_for_variant),
                     ..Default::default()
                 };
                 engine
                     .load_model_with_params(&resolved.path, params)
-                    .map_err(|err| anyhow!(err.to_string()))?;
-                Ok(EngineInstance::Whisper { engine })
+                    .map_err(boxed_error)?;
+                Ok(EngineInstance::Whisper(engine))
             }
-
             #[cfg(not(feature = "whisper"))]
             {
                 Err(anyhow!("Whisper support is not enabled"))
             }
         }
         ModelEngine::Parakeet => {
-            #[cfg(all(
-                feature = "nvidia",
-                not(all(target_os = "macos", target_arch = "x86_64"))
-            ))]
+            #[cfg(nvidia_engines)]
             {
-                let mut engine = crate::engines::parakeet::ParakeetEngine::new();
+                use crate::engines::parakeet::{ParakeetEngine, ParakeetModelParams};
+
+                let mut engine = ParakeetEngine::new();
                 engine
                     .load_model_with_params(
                         &resolved.path,
-                        crate::engines::parakeet::ParakeetModelParams::int8_with_layout(
-                            resolved.layout,
-                        ),
+                        ParakeetModelParams::int8_with_layout(resolved.layout),
                     )
-                    .map_err(|err| anyhow!(err.to_string()))?;
-                Ok(EngineInstance::Parakeet { engine })
+                    .map_err(boxed_error)?;
+                Ok(EngineInstance::Parakeet(engine))
             }
-
-            #[cfg(not(all(
-                feature = "nvidia",
-                not(all(target_os = "macos", target_arch = "x86_64"))
-            )))]
+            #[cfg(not(nvidia_engines))]
             {
                 Err(anyhow!(
                     "NVIDIA speech support is not enabled on this build"
@@ -626,22 +506,13 @@ fn load_engine(resolved: &crate::models::ResolvedModel) -> Result<EngineInstance
             }
         }
         ModelEngine::Nemotron => {
-            #[cfg(all(
-                feature = "nvidia",
-                not(all(target_os = "macos", target_arch = "x86_64"))
-            ))]
+            #[cfg(nvidia_engines)]
             {
                 let mut engine = crate::engines::nemotron::NemotronEngine::new();
-                engine
-                    .load_model(&resolved.path)
-                    .map_err(|err| anyhow!(err.to_string()))?;
-                Ok(EngineInstance::Nemotron { engine })
+                engine.load_model(&resolved.path).map_err(boxed_error)?;
+                Ok(EngineInstance::Nemotron(engine))
             }
-
-            #[cfg(not(all(
-                feature = "nvidia",
-                not(all(target_os = "macos", target_arch = "x86_64"))
-            )))]
+            #[cfg(not(nvidia_engines))]
             {
                 Err(anyhow!(
                     "NVIDIA speech support is not enabled on this build"
@@ -649,20 +520,15 @@ fn load_engine(resolved: &crate::models::ResolvedModel) -> Result<EngineInstance
             }
         }
         ModelEngine::Apple => {
-            #[cfg(all(feature = "apple-speech", target_os = "macos", target_arch = "aarch64"))]
+            #[cfg(apple_speech_engine)]
             {
                 let mut engine = crate::engines::apple::AppleEngine::new();
                 engine
                     .load_model_with_params(&resolved.path, ())
-                    .map_err(|err| anyhow!(err.to_string()))?;
-                Ok(EngineInstance::Apple { engine })
+                    .map_err(boxed_error)?;
+                Ok(EngineInstance::Apple(engine))
             }
-
-            #[cfg(not(all(
-                feature = "apple-speech",
-                target_os = "macos",
-                target_arch = "aarch64"
-            )))]
+            #[cfg(not(apple_speech_engine))]
             {
                 Err(anyhow!("Apple speech support is not enabled on this build"))
             }
@@ -676,8 +542,9 @@ fn transcribe_with_engine(
 ) -> Result<TranscriptionWithDuration> {
     match engine {
         #[cfg(feature = "whisper")]
-        EngineInstance::Whisper { engine } => {
-            let params = Some(crate::engines::whisper::WhisperInferenceParams {
+        EngineInstance::Whisper(engine) => {
+            let wants_timestamps = _request.timestamps || _request.timestamp_granularity.is_some();
+            let params = crate::engines::whisper::WhisperInferenceParams {
                 dictionary: if _request.prompt.is_some() {
                     Vec::new()
                 } else {
@@ -685,59 +552,44 @@ fn transcribe_with_engine(
                 },
                 language: _request.language,
                 initial_prompt: combined_prompt(_request.prompt, &_request.dictionary),
-                print_timestamps: _request.timestamps || _request.timestamp_granularity.is_some(),
-                word_timestamps: matches!(
-                    _request.timestamp_granularity,
-                    Some(TimestampGranularity::Word)
-                ),
+                print_timestamps: wants_timestamps,
+                word_timestamps: _request.timestamp_granularity == Some(TimestampGranularity::Word),
                 ..Default::default()
-            });
-            transcribe_audio(engine, _request.audio, params)
-        }
-        #[cfg(all(
-            feature = "nvidia",
-            not(all(target_os = "macos", target_arch = "x86_64"))
-        ))]
-        EngineInstance::Parakeet { engine } => {
-            let timestamp_granularity = match _request.timestamp_granularity {
-                Some(TimestampGranularity::Word) => {
-                    crate::engines::parakeet::TimestampGranularity::Word
-                }
-                Some(TimestampGranularity::Segment) => {
-                    crate::engines::parakeet::TimestampGranularity::Segment
-                }
-                None if _request.timestamps => {
-                    crate::engines::parakeet::TimestampGranularity::Segment
-                }
-                None => crate::engines::parakeet::TimestampGranularity::Token,
             };
-            let params = Some(crate::engines::parakeet::ParakeetInferenceParams {
+            transcribe_audio(engine, _request.audio, Some(params))
+        }
+        #[cfg(nvidia_engines)]
+        EngineInstance::Parakeet(engine) => {
+            use crate::engines::parakeet::TimestampGranularity as Granularity;
+
+            let timestamp_granularity = match _request.timestamp_granularity {
+                Some(TimestampGranularity::Word) => Granularity::Word,
+                Some(TimestampGranularity::Segment) => Granularity::Segment,
+                None if _request.timestamps => Granularity::Segment,
+                None => Granularity::Token,
+            };
+            let params = crate::engines::parakeet::ParakeetInferenceParams {
                 timestamp_granularity,
                 language: _request.language,
                 dictionary: _request.dictionary,
-            });
-            transcribe_audio(engine, _request.audio, params)
+            };
+            transcribe_audio(engine, _request.audio, Some(params))
         }
-        #[cfg(all(
-            feature = "nvidia",
-            not(all(target_os = "macos", target_arch = "x86_64"))
-        ))]
-        EngineInstance::Nemotron { engine } => transcribe_audio(
-            engine,
-            _request.audio,
-            Some(crate::engines::nemotron::NemotronInferenceParams {
+        #[cfg(nvidia_engines)]
+        EngineInstance::Nemotron(engine) => {
+            let params = crate::engines::nemotron::NemotronInferenceParams {
                 language: _request.language,
-            }),
-        ),
-        #[cfg(all(feature = "apple-speech", target_os = "macos", target_arch = "aarch64"))]
-        EngineInstance::Apple { engine } => {
-            let long_form = _request.timestamps || _request.timestamp_granularity.is_some();
-            let params = Some(crate::engines::apple::AppleInferenceParams {
+            };
+            transcribe_audio(engine, _request.audio, Some(params))
+        }
+        #[cfg(apple_speech_engine)]
+        EngineInstance::Apple(engine) => {
+            let params = crate::engines::apple::AppleInferenceParams {
                 language: _request.language,
-                long_form,
+                long_form: _request.timestamps || _request.timestamp_granularity.is_some(),
                 dictionary: _request.dictionary,
-            });
-            transcribe_audio(engine, _request.audio, params)
+            };
+            transcribe_audio(engine, _request.audio, Some(params))
         }
         #[allow(unreachable_patterns)]
         _ => Err(anyhow!("No speech engine support is enabled")),
@@ -757,14 +609,7 @@ fn combined_prompt(prompt: Option<String>, dictionary: &[String]) -> Option<Stri
     }
 }
 
-#[cfg(any(
-    feature = "whisper",
-    all(
-        feature = "nvidia",
-        not(all(target_os = "macos", target_arch = "x86_64"))
-    ),
-    all(feature = "apple-speech", target_os = "macos", target_arch = "aarch64")
-))]
+#[cfg(local_engines)]
 fn transcribe_audio<E: TranscriptionEngine>(
     engine: &mut E,
     audio: AudioInput,
@@ -773,26 +618,21 @@ fn transcribe_audio<E: TranscriptionEngine>(
     let prepared = prepare_audio(audio)?;
     let result = engine
         .transcribe_samples(prepared.samples, params)
-        .map_err(|err| anyhow!(err.to_string()))?;
+        .map_err(boxed_error)?;
     Ok(TranscriptionWithDuration {
         result,
         audio_duration_ms: prepared.duration_ms,
     })
 }
 
-#[cfg(any(
-    feature = "whisper",
-    all(
-        feature = "nvidia",
-        not(all(target_os = "macos", target_arch = "x86_64"))
-    ),
-    all(feature = "apple-speech", target_os = "macos", target_arch = "aarch64")
-))]
+#[cfg(local_engines)]
 fn prepare_audio(audio: AudioInput) -> Result<PreparedAudio> {
+    const MIN_SAMPLES: usize = 16_000;
+    const EXTRA_PADDING: usize = 4_000;
+
     let (mut samples, source_sample_rate, source_sample_count) = match audio {
         AudioInput::WavPath(path) => {
-            let samples =
-                crate::audio::read_audio_samples(&path).map_err(|err| anyhow!(err.to_string()))?;
+            let samples = crate::audio::read_audio_samples(&path).map_err(boxed_error)?;
             let sample_count = samples.len();
             (samples, 16_000, sample_count)
         }
@@ -805,26 +645,11 @@ fn prepare_audio(audio: AudioInput) -> Result<PreparedAudio> {
             sample_rate,
         } => {
             let sample_count = samples.len();
-            if sample_rate == 16_000 {
-                let normalized = samples
-                    .into_iter()
-                    .map(|sample| sample as f32 / 32_768.0)
-                    .collect();
-                (normalized, sample_rate, sample_count)
-            } else {
-                // Normalize and resample in a single pass over one output
-                // buffer instead of materializing an intermediate f32 copy.
-                (
-                    crate::audio::resample_i16_to_f32(&samples, sample_rate, 16_000),
-                    sample_rate,
-                    sample_count,
-                )
-            }
+            // Normalizes and resamples in one pass; at 16 kHz it only scales.
+            let normalized = crate::audio::resample_i16_to_f32(&samples, sample_rate, 16_000);
+            (normalized, sample_rate, sample_count)
         }
     };
-
-    const MIN_SAMPLES: usize = 16_000;
-    const EXTRA_PADDING: usize = 4_000;
 
     let padding_needed = MIN_SAMPLES.saturating_sub(samples.len()) + EXTRA_PADDING;
     samples.extend(std::iter::repeat_n(0.0f32, padding_needed));
@@ -834,33 +659,17 @@ fn prepare_audio(audio: AudioInput) -> Result<PreparedAudio> {
     })
 }
 
-#[cfg(any(
-    feature = "whisper",
-    all(
-        feature = "nvidia",
-        not(all(target_os = "macos", target_arch = "x86_64"))
-    ),
-    all(feature = "apple-speech", target_os = "macos", target_arch = "aarch64")
-))]
+#[cfg(local_engines)]
 fn audio_duration_ms(sample_count: usize, sample_rate: u32) -> u128 {
     if sample_rate == 0 {
         return 0;
     }
-    ((sample_count as u128) * 1000) / sample_rate as u128
+    (sample_count as u128 * 1000) / u128::from(sample_rate)
 }
 
-#[cfg(all(
-    test,
-    any(
-        feature = "whisper",
-        all(
-            feature = "nvidia",
-            not(all(target_os = "macos", target_arch = "x86_64"))
-        )
-    )
-))]
+#[cfg(all(test, local_engines))]
 mod prepare_tests {
-    use super::{prepare_audio, AudioInput};
+    use super::{AudioInput, prepare_audio};
 
     #[test]
     fn pcm_with_zero_sample_rate_does_not_blow_up() {

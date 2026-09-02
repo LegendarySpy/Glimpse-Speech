@@ -2,8 +2,8 @@ use std::{error::Error as StdError, fmt, sync::Arc};
 
 use anyhow::anyhow;
 
-use crate::service::{SpeechService, TranscribeRequest};
 use crate::Transcription;
+use crate::service::{SpeechService, TranscribeRequest};
 
 #[cfg(feature = "remote")]
 use crate::service::AudioInput;
@@ -77,7 +77,12 @@ impl RemoteUpstream {
         config: RemoteConfig,
         fallback: Option<Arc<SpeechProvider>>,
     ) -> Self {
-        let default_model = config.model.clone();
+        let default_model = config
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
         Self {
             engine: RemoteEngine::new(client, config),
             default_model,
@@ -131,15 +136,9 @@ impl SpeechProvider {
 #[cfg(feature = "remote")]
 impl RemoteUpstream {
     async fn remote_model_ids(&self) -> Result<Vec<String>, TranscribeError> {
-        if let Some(model) = self
-            .default_model
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            return Ok(vec![model.to_string()]);
+        if let Some(model) = &self.default_model {
+            return Ok(vec![model.clone()]);
         }
-
         self.engine
             .list_models()
             .await
@@ -150,28 +149,24 @@ impl RemoteUpstream {
         &self,
         request: TranscribeRequest,
     ) -> Result<Transcription, TranscribeError> {
-        let audio_path = match &request.audio {
-            AudioInput::WavPath(path) => path.clone(),
-            _ => {
-                return match &self.fallback {
-                    Some(fallback) => transcribe_via_fallback(fallback, request).await,
-                    None => Err(TranscribeError::Remote(crate::remote::config_error(
-                        "Remote provider requires an audio file upload",
-                    ))),
-                };
-            }
+        let AudioInput::WavPath(audio_path) = &request.audio else {
+            return match &self.fallback {
+                Some(fallback) => transcribe_via_fallback(fallback, request).await,
+                None => Err(TranscribeError::Remote(crate::remote::config_error(
+                    "Remote provider requires an audio file upload",
+                ))),
+            };
         };
 
         let model = self
             .default_model
             .as_deref()
-            .filter(|value| !value.trim().is_empty())
             .unwrap_or(request.model_id.as_str());
 
         let result = self
             .engine
             .transcribe_file(
-                &audio_path,
+                audio_path,
                 RemoteRequestParams {
                     model,
                     language: request.language.as_deref(),
@@ -183,21 +178,20 @@ impl RemoteUpstream {
             )
             .await;
 
-        match result {
-            Ok(response) => Ok(Transcription {
+        match (result, &self.fallback) {
+            (Ok(response), _) => Ok(Transcription {
                 model_id: format!("remote:{}", response.model_id),
                 language: response.language.or(request.language),
                 ..response
             }),
-            Err(err) if self.fallback.is_some() && err.should_fallback() => {
-                let fallback = self.fallback.as_ref().expect("checked above");
+            (Err(err), Some(fallback)) if err.should_fallback() => {
                 eprintln!(
                     "Remote speech temporarily unavailable, falling back to local: {}",
                     err.user_message()
                 );
                 transcribe_via_fallback(fallback, request).await
             }
-            Err(err) => Err(TranscribeError::Remote(err)),
+            (Err(err), _) => Err(TranscribeError::Remote(err)),
         }
     }
 }

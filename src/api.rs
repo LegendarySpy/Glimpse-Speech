@@ -4,32 +4,35 @@ use std::{
     io,
     net::SocketAddr,
     path::PathBuf,
+    str::FromStr,
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
     },
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use axum::{
+    Json, Router,
     body::Body,
     extract::{DefaultBodyLimit, FromRequest, Multipart, Path, Request, State},
-    http::{header::CONTENT_TYPE, HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header::CONTENT_TYPE},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
-    Json, Router,
 };
 use serde::Serialize;
 use tokio::io::AsyncWriteExt;
 use tower_http::cors::CorsLayer;
 
 use crate::{
+    TimestampGranularity, Transcription, UnsupportedValue,
     models::{InstallOptions, ModelDownloadProgress},
     provider::{SpeechProvider, TranscribeError},
     service::{AudioInput, SpeechService, TranscribeRequest},
-    TimestampGranularity, Transcription,
 };
+
+type ApiError = (StatusCode, Json<ErrorBody>);
 
 #[derive(Clone)]
 pub struct ApiConfig {
@@ -163,33 +166,43 @@ struct TranscriptionRequestParts {
 
 static TEMP_UPLOAD_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-struct TempUpload {
-    path: PathBuf,
-}
-
-impl TempUpload {
-    fn new(path: PathBuf) -> Self {
-        Self { path }
-    }
-
-    fn path(&self) -> &PathBuf {
-        &self.path
-    }
-}
+struct TempUpload(PathBuf);
 
 impl Drop for TempUpload {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        let _ = std::fs::remove_file(&self.0);
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ResponseFormat {
+pub(crate) enum ResponseFormat {
     Json,
     Text,
     VerboseJson,
     Srt,
     Vtt,
+}
+
+impl ResponseFormat {
+    /// Formats that carry timestamps and therefore need segment output.
+    fn needs_timestamps(self) -> bool {
+        matches!(self, Self::VerboseJson | Self::Srt | Self::Vtt)
+    }
+}
+
+impl FromStr for ResponseFormat {
+    type Err = UnsupportedValue;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "json" => Ok(Self::Json),
+            "text" => Ok(Self::Text),
+            "verbose_json" => Ok(Self::VerboseJson),
+            "srt" => Ok(Self::Srt),
+            "vtt" => Ok(Self::Vtt),
+            other => Err(UnsupportedValue(other.to_string())),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -287,7 +300,7 @@ pub async fn serve_with_shutdown(
 async fn list_models(
     State(state): State<ApiState>,
     headers: HeaderMap,
-) -> Result<Response, (StatusCode, Json<ErrorBody>)> {
+) -> Result<Response, ApiError> {
     authorize(&state, &headers)?;
     state.log("info", "GET /v1/models".to_string());
     if let Some(remote_ids) = state.provider.remote_model_ids().await {
@@ -299,8 +312,7 @@ async fn list_models(
     let models = state
         .local_model_source
         .as_ref()
-        .map(|source| source())
-        .unwrap_or_else(|| (*state.local_models).clone());
+        .map_or_else(|| (*state.local_models).clone(), |source| source());
     Ok(Json(ListResponse::new(models)).into_response())
 }
 
@@ -320,7 +332,7 @@ async fn install_model(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Path(id): Path<String>,
-) -> Result<Json<InstallResponse>, (StatusCode, Json<ErrorBody>)> {
+) -> Result<Json<InstallResponse>, ApiError> {
     authorize(&state, &headers)?;
     state.log("info", format!("POST /v1/models/{id}/install"));
     let progress = Arc::new(Mutex::new(Vec::new()));
@@ -354,7 +366,7 @@ async fn delete_model(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Path(id): Path<String>,
-) -> Result<Json<crate::models::ModelStatus>, (StatusCode, Json<ErrorBody>)> {
+) -> Result<Json<crate::models::ModelStatus>, ApiError> {
     authorize(&state, &headers)?;
     state.log("info", format!("DELETE /v1/models/{id}"));
     state.service.delete(&id).map(Json).map_err(map_error)
@@ -364,7 +376,7 @@ async fn transcribe(
     State(state): State<ApiState>,
     headers: HeaderMap,
     request: Request<Body>,
-) -> Result<Response, (StatusCode, Json<ErrorBody>)> {
+) -> Result<Response, ApiError> {
     authorize(&state, &headers)?;
     state.log("info", "POST /v1/audio/transcriptions".to_string());
     let content_type = headers
@@ -406,27 +418,25 @@ async fn transcribe(
 
 impl ApiState {
     fn log(&self, level: &'static str, message: String) {
-        if let Some(sink) = &self.event_sink {
-            sink(ApiEvent {
-                level,
-                message,
-                model_id: None,
-            });
-        }
+        self.emit(level, message, None);
     }
 
     fn log_model(&self, level: &'static str, message: String, model_id: &str) {
+        self.emit(level, message, Some(model_id.to_string()));
+    }
+
+    fn emit(&self, level: &'static str, message: String, model_id: Option<String>) {
         if let Some(sink) = &self.event_sink {
             sink(ApiEvent {
                 level,
                 message,
-                model_id: Some(model_id.to_string()),
+                model_id,
             });
         }
     }
 }
 
-fn authorize(state: &ApiState, headers: &HeaderMap) -> Result<(), (StatusCode, Json<ErrorBody>)> {
+fn authorize(state: &ApiState, headers: &HeaderMap) -> Result<(), ApiError> {
     let Some(expected) = &state.api_key else {
         return Ok(());
     };
@@ -459,7 +469,7 @@ fn is_multipart_content_type(value: &str) -> bool {
 
 fn build_transcription_request(
     parts: TranscriptionRequestParts,
-) -> Result<ParsedTranscriptionRequest, (StatusCode, Json<ErrorBody>)> {
+) -> Result<ParsedTranscriptionRequest, ApiError> {
     let TranscriptionRequestParts {
         model,
         audio,
@@ -478,19 +488,19 @@ fn build_transcription_request(
         )));
     }
 
-    let response_format = parse_response_format(response_format.as_deref().unwrap_or("json"))?;
+    let response_format = response_format
+        .as_deref()
+        .unwrap_or("json")
+        .parse::<ResponseFormat>()
+        .map_err(|value| map_error(anyhow!("Unsupported response_format {value}")))?;
     let timestamp_granularities = parse_timestamp_granularities(timestamp_granularities)?;
     if !timestamp_granularities.is_empty() && response_format != ResponseFormat::VerboseJson {
         return Err(map_error(anyhow!(
             "`timestamp_granularities` requires response_format `verbose_json`"
         )));
     }
-    let needs_timestamps = timestamps
-        || !timestamp_granularities.is_empty()
-        || matches!(
-            response_format,
-            ResponseFormat::VerboseJson | ResponseFormat::Srt | ResponseFormat::Vtt
-        );
+    let needs_timestamps =
+        timestamps || !timestamp_granularities.is_empty() || response_format.needs_timestamps();
 
     Ok(ParsedTranscriptionRequest {
         request: TranscribeRequest {
@@ -519,35 +529,16 @@ fn service_timestamp_granularity(values: &[TimestampGranularity]) -> Option<Time
     }
 }
 
-fn parse_response_format(value: &str) -> Result<ResponseFormat, (StatusCode, Json<ErrorBody>)> {
-    match value {
-        "json" => Ok(ResponseFormat::Json),
-        "text" => Ok(ResponseFormat::Text),
-        "verbose_json" => Ok(ResponseFormat::VerboseJson),
-        "srt" => Ok(ResponseFormat::Srt),
-        "vtt" => Ok(ResponseFormat::Vtt),
-        other => Err(map_error(anyhow!("Unsupported response_format `{other}`"))),
-    }
-}
-
 fn parse_timestamp_granularities(
     values: Vec<String>,
-) -> Result<Vec<TimestampGranularity>, (StatusCode, Json<ErrorBody>)> {
+) -> Result<Vec<TimestampGranularity>, ApiError> {
     let mut parsed = Vec::new();
-    for value in values {
-        for entry in split_field_values(&value) {
-            let granularity = match entry.as_str() {
-                "segment" => TimestampGranularity::Segment,
-                "word" => TimestampGranularity::Word,
-                other => {
-                    return Err(map_error(anyhow!(
-                        "Unsupported timestamp granularity `{other}`"
-                    )))
-                }
-            };
-            if !parsed.contains(&granularity) {
-                parsed.push(granularity);
-            }
+    for entry in values.iter().flat_map(|value| split_field_values(value)) {
+        let granularity = entry
+            .parse::<TimestampGranularity>()
+            .map_err(|value| map_error(anyhow!("Unsupported timestamp granularity {value}")))?;
+        if !parsed.contains(&granularity) {
+            parsed.push(granularity);
         }
     }
     Ok(parsed)
@@ -582,8 +573,7 @@ pub(crate) fn verbose_response(
         .then(|| verbose_words(&response));
     let duration = segments
         .last()
-        .map(|segment| segment.end)
-        .unwrap_or(response.duration_ms as f32 / 1000.0);
+        .map_or(response.duration_ms as f32 / 1000.0, |segment| segment.end);
 
     VerboseTranscriptionResponse {
         task: "transcribe",
@@ -721,7 +711,7 @@ fn format_timestamp(seconds: f32, decimal_separator: char) -> String {
 async fn transcribe_request_from_multipart(
     request: Request<Body>,
     state: &ApiState,
-) -> Result<ParsedTranscriptionRequest, (StatusCode, Json<ErrorBody>)> {
+) -> Result<ParsedTranscriptionRequest, ApiError> {
     let mut multipart = Multipart::from_request(request, state)
         .await
         .map_err(|err| map_error(anyhow!(err.to_string())))?;
@@ -782,7 +772,7 @@ async fn transcribe_request_from_multipart(
 
     let upload =
         uploaded_file.ok_or_else(|| map_error(anyhow!("Missing multipart file field `file`")))?;
-    let audio_path = upload.path().clone();
+    let audio_path = upload.0.clone();
     let model = model.ok_or_else(|| map_error(anyhow!("Missing multipart field `model`")))?;
 
     let mut parsed = build_transcription_request(TranscriptionRequestParts {
@@ -800,9 +790,7 @@ async fn transcribe_request_from_multipart(
     Ok(parsed)
 }
 
-async fn field_text(
-    field: axum::extract::multipart::Field<'_>,
-) -> Result<String, (StatusCode, Json<ErrorBody>)> {
+async fn field_text(field: axum::extract::multipart::Field<'_>) -> Result<String, ApiError> {
     field
         .text()
         .await
@@ -825,18 +813,18 @@ fn parse_bool(value: &str) -> bool {
     )
 }
 
-fn map_error(error: anyhow::Error) -> (StatusCode, Json<ErrorBody>) {
+fn map_error(error: anyhow::Error) -> ApiError {
     (StatusCode::BAD_REQUEST, Json(error_body(error.to_string())))
 }
 
-fn map_server_error(error: anyhow::Error) -> (StatusCode, Json<ErrorBody>) {
+fn map_server_error(error: anyhow::Error) -> ApiError {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(typed_error_body(error.to_string(), "server_error")),
     )
 }
 
-fn map_transcribe_error(error: TranscribeError) -> (StatusCode, Json<ErrorBody>) {
+fn map_transcribe_error(error: TranscribeError) -> ApiError {
     match error {
         TranscribeError::Local(err) => map_local_transcribe_error(err),
         #[cfg(feature = "remote")]
@@ -844,7 +832,7 @@ fn map_transcribe_error(error: TranscribeError) -> (StatusCode, Json<ErrorBody>)
     }
 }
 
-fn map_local_transcribe_error(error: anyhow::Error) -> (StatusCode, Json<ErrorBody>) {
+fn map_local_transcribe_error(error: anyhow::Error) -> ApiError {
     if error.to_string().starts_with("Unknown model:") {
         map_error(error)
     } else {
@@ -853,24 +841,18 @@ fn map_local_transcribe_error(error: anyhow::Error) -> (StatusCode, Json<ErrorBo
 }
 
 #[cfg(feature = "remote")]
-fn map_remote_error(error: crate::remote::RemoteError) -> (StatusCode, Json<ErrorBody>) {
-    let status = match error.kind {
-        crate::remote::RemoteErrorKind::RateLimited => StatusCode::TOO_MANY_REQUESTS,
-        crate::remote::RemoteErrorKind::QuotaExceeded => StatusCode::PAYMENT_REQUIRED,
-        crate::remote::RemoteErrorKind::Unauthorized => StatusCode::UNAUTHORIZED,
-        crate::remote::RemoteErrorKind::InvalidRequest => StatusCode::BAD_REQUEST,
-        crate::remote::RemoteErrorKind::NotFound => StatusCode::NOT_FOUND,
-        crate::remote::RemoteErrorKind::UpstreamUnavailable
-        | crate::remote::RemoteErrorKind::Other => StatusCode::BAD_GATEWAY,
-    };
-    let error_type = match error.kind {
-        crate::remote::RemoteErrorKind::RateLimited => "rate_limit_error",
-        crate::remote::RemoteErrorKind::QuotaExceeded => "insufficient_quota",
-        crate::remote::RemoteErrorKind::Unauthorized => "authentication_error",
-        crate::remote::RemoteErrorKind::InvalidRequest => "invalid_request_error",
-        crate::remote::RemoteErrorKind::NotFound => "not_found_error",
-        crate::remote::RemoteErrorKind::UpstreamUnavailable
-        | crate::remote::RemoteErrorKind::Other => "upstream_error",
+fn map_remote_error(error: crate::remote::RemoteError) -> ApiError {
+    use crate::remote::RemoteErrorKind;
+
+    let (status, error_type) = match error.kind {
+        RemoteErrorKind::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "rate_limit_error"),
+        RemoteErrorKind::QuotaExceeded => (StatusCode::PAYMENT_REQUIRED, "insufficient_quota"),
+        RemoteErrorKind::Unauthorized => (StatusCode::UNAUTHORIZED, "authentication_error"),
+        RemoteErrorKind::InvalidRequest => (StatusCode::BAD_REQUEST, "invalid_request_error"),
+        RemoteErrorKind::NotFound => (StatusCode::NOT_FOUND, "not_found_error"),
+        RemoteErrorKind::UpstreamUnavailable | RemoteErrorKind::Other => {
+            (StatusCode::BAD_GATEWAY, "upstream_error")
+        }
     };
     (
         status,
@@ -905,7 +887,7 @@ fn typed_error_body(message: impl Into<String>, error_type: &'static str) -> Err
 async fn write_temp_audio(
     extension: Option<&OsStr>,
     field: &mut axum::extract::multipart::Field<'_>,
-) -> Result<TempUpload, (StatusCode, Json<ErrorBody>)> {
+) -> Result<TempUpload, ApiError> {
     for _ in 0..16 {
         let path = temp_audio_path(extension);
         let file = tokio::fs::OpenOptions::new()
@@ -924,7 +906,7 @@ async fn write_temp_audio(
             }
         };
 
-        let upload = TempUpload::new(path);
+        let upload = TempUpload(path);
         let mut writer = tokio::io::BufWriter::new(file);
         while let Some(chunk) = field
             .chunk()
@@ -934,13 +916,13 @@ async fn write_temp_audio(
             writer
                 .write_all(&chunk)
                 .await
-                .with_context(|| format!("write uploaded audio to {}", upload.path().display()))
+                .with_context(|| format!("write uploaded audio to {}", upload.0.display()))
                 .map_err(map_server_error)?;
         }
         writer
             .flush()
             .await
-            .with_context(|| format!("write uploaded audio to {}", upload.path().display()))
+            .with_context(|| format!("write uploaded audio to {}", upload.0.display()))
             .map_err(map_server_error)?;
         return Ok(upload);
     }
@@ -960,11 +942,7 @@ fn temp_audio_path(extension: Option<&OsStr>) -> PathBuf {
         "glimpse-speech-upload-{}-{timestamp}-{sequence}",
         std::process::id(),
     ));
-    if let Some(extension) = extension {
-        path.set_extension(extension);
-    } else {
-        path.set_extension("wav");
-    }
+    path.set_extension(extension.unwrap_or(OsStr::new("wav")));
     path
 }
 
@@ -1044,6 +1022,13 @@ mod tests {
             parsed.request.timestamp_granularity,
             Some(TimestampGranularity::Segment)
         );
+    }
+
+    #[test]
+    fn parses_response_formats() {
+        assert_eq!("srt".parse(), Ok(ResponseFormat::Srt));
+        assert_eq!("verbose_json".parse(), Ok(ResponseFormat::VerboseJson));
+        assert!("xml".parse::<ResponseFormat>().is_err());
     }
 
     #[test]

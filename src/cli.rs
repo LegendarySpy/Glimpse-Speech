@@ -3,17 +3,24 @@ use std::{
     sync::Arc,
 };
 
+use anyhow::{Context, anyhow, bail};
 use clap::{Parser, Subcommand};
 use directories::ProjectDirs;
 
 use crate::{
-    models::{InstallSpec, ModelEngine, ModelInstallManager, ModelStorage, RemoteFile},
+    TimestampGranularity, Transcription,
+    api::{ApiConfig, ApiEventSink, ResponseFormat, format_srt, format_vtt, verbose_response},
+    models::{
+        InstallSpec, ModelEngine, ModelInstallManager, ModelStatus, ModelStorage, RemoteFile,
+    },
     service::{AudioInput, SpeechService, TranscribeRequest},
-    Transcription,
 };
 
+const CACHE_DIR_ENV: &str = "GLIMPSE_SPEECH_CACHE_DIR";
+const LISTENING_PREFIX: &str = "Local API listening on ";
+
 fn default_cache_dir() -> PathBuf {
-    if let Ok(value) = std::env::var("GLIMPSE_SPEECH_CACHE_DIR") {
+    if let Ok(value) = std::env::var(CACHE_DIR_ENV) {
         return PathBuf::from(value);
     }
 
@@ -26,28 +33,12 @@ fn default_cache_dir() -> PathBuf {
             .join("models");
     }
 
-    if let Some(project_dirs) = ProjectDirs::from("com", "Glimpse", "glimpse-speech") {
-        return project_dirs.data_local_dir().join("models");
-    }
-
-    PathBuf::from("glimpse-speech").join("models")
-}
-
-#[derive(Debug, Clone, Copy, clap::ValueEnum)]
-enum CliEngine {
-    Whisper,
-    Parakeet,
-    Nemotron,
-}
-
-impl From<CliEngine> for ModelEngine {
-    fn from(engine: CliEngine) -> Self {
-        match engine {
-            CliEngine::Whisper => ModelEngine::Whisper,
-            CliEngine::Parakeet => ModelEngine::Parakeet,
-            CliEngine::Nemotron => ModelEngine::Nemotron,
-        }
-    }
+    ProjectDirs::from("com", "Glimpse", "glimpse-speech")
+        .map_or_else(
+            || PathBuf::from("glimpse-speech"),
+            |dirs| dirs.data_local_dir().to_path_buf(),
+        )
+        .join("models")
 }
 
 #[derive(Debug, Parser)]
@@ -72,8 +63,8 @@ enum Command {
         audio: PathBuf,
         #[arg(long)]
         model: String,
-        #[arg(long, value_enum, default_value_t = CliEngine::Whisper)]
-        engine: CliEngine,
+        #[arg(long, value_enum, default_value_t = ModelEngine::Whisper)]
+        engine: ModelEngine,
         #[arg(long)]
         language: Option<String>,
         #[arg(long)]
@@ -85,31 +76,34 @@ enum Command {
         #[arg(long = "dictionary")]
         dictionary: Vec<String>,
     },
-    Serve {
-        #[arg(long, default_value = "127.0.0.1")]
-        host: String,
-        #[arg(long, default_value_t = 11435)]
-        port: u16,
-        #[arg(long)]
-        model: Option<String>,
-        #[arg(long, value_enum, default_value_t = CliEngine::Whisper)]
-        engine: CliEngine,
-        #[arg(long)]
-        api_key: Option<String>,
-        /// Upstream OpenAI-compatible speech endpoint. When set, transcriptions proxy remotely.
-        #[arg(long)]
-        remote_endpoint: Option<String>,
-        #[arg(long)]
-        remote_api_key: Option<String>,
-        #[arg(long)]
-        remote_model: Option<String>,
-        /// Enable permissive CORS headers for browser clients.
-        #[arg(long)]
-        cors: bool,
-        /// Deprecated compatibility flag. CORS is disabled by default.
-        #[arg(long = "no-cors")]
-        no_cors: bool,
-    },
+    Serve(ServeArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct ServeArgs {
+    #[arg(long, default_value = "127.0.0.1")]
+    host: String,
+    #[arg(long, default_value_t = 11435)]
+    port: u16,
+    #[arg(long)]
+    model: Option<String>,
+    #[arg(long, value_enum, default_value_t = ModelEngine::Whisper)]
+    engine: ModelEngine,
+    #[arg(long)]
+    api_key: Option<String>,
+    /// Upstream OpenAI-compatible speech endpoint. When set, transcriptions proxy remotely.
+    #[arg(long)]
+    remote_endpoint: Option<String>,
+    #[arg(long)]
+    remote_api_key: Option<String>,
+    #[arg(long)]
+    remote_model: Option<String>,
+    /// Enable permissive CORS headers for browser clients.
+    #[arg(long)]
+    cors: bool,
+    /// Deprecated compatibility flag. CORS is disabled by default.
+    #[arg(long = "no-cors")]
+    no_cors: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -154,7 +148,7 @@ pub async fn run() -> anyhow::Result<()> {
             timestamps,
             dictionary,
         } => {
-            let service = SpeechService::new_loose_with_engine(cache_dir, engine.into());
+            let service = SpeechService::new_loose_with_engine(cache_dir, engine);
             let response = service.transcribe(TranscribeRequest {
                 audio: AudioInput::WavPath(audio),
                 model_id: model,
@@ -162,168 +156,149 @@ pub async fn run() -> anyhow::Result<()> {
                 prompt,
                 dictionary,
                 timestamps,
-                timestamp_granularity: timestamps.then_some(crate::TimestampGranularity::Segment),
+                timestamp_granularity: timestamps.then_some(TimestampGranularity::Segment),
             })?;
-            print_transcription_response(response, &response_format, cli.json)?;
-            Ok(())
+            print_transcription_response(response, &response_format, cli.json)
         }
-        Command::Serve {
-            host,
-            port,
-            model,
-            engine,
-            api_key,
-            remote_endpoint,
-            remote_api_key,
-            remote_model,
-            cors,
-            no_cors,
-        } => {
-            let cors_enabled = cors && !no_cors;
-            let remote_enabled = remote_endpoint
-                .as_deref()
-                .is_some_and(|endpoint| !endpoint.trim().is_empty());
-            let event_sink = serve_event_sink(
-                cache_dir.clone(),
-                model.clone(),
-                engine,
-                remote_enabled,
-                api_key.as_deref().is_some_and(|key| !key.trim().is_empty()),
-                cors_enabled,
-            );
-            let service = std::sync::Arc::new(
-                crate::service::SpeechService::new_loose_with_engine(cache_dir, engine.into()),
-            );
-            if !remote_enabled {
-                if let Some(model_id) = model.as_deref() {
-                    let warm = std::sync::Arc::clone(&service);
-                    let model_id = model_id.to_string();
-                    let label = model_id.clone();
-                    tokio::task::spawn_blocking(move || warm.preload_and_warm(&model_id))
-                        .await
-                        .map_err(|err| anyhow::anyhow!("warm model task failed: {err}"))?
-                        .map_err(|err| anyhow::anyhow!("warm model `{label}`: {err}"))?;
-                }
-            }
-            #[cfg(feature = "remote")]
-            let transcription_provider = if remote_enabled {
-                let endpoint = remote_endpoint
-                    .as_deref()
-                    .map(str::trim)
-                    .unwrap_or_default()
-                    .to_string();
-                let remote_model = remote_model
-                    .or(model.clone())
-                    .filter(|value| !value.trim().is_empty());
-                Some(std::sync::Arc::new(crate::provider::build_remote_provider(
-                    reqwest::Client::new(),
-                    crate::remote::RemoteConfig {
-                        endpoint,
-                        api_key: remote_api_key.unwrap_or_default(),
-                        model: remote_model,
-                    },
-                    std::sync::Arc::clone(&service),
-                )))
-            } else {
-                None
-            };
-            #[cfg(not(feature = "remote"))]
-            let _ = (&remote_api_key, &remote_model);
-            #[cfg(not(feature = "remote"))]
-            let transcription_provider: Option<
-                std::sync::Arc<crate::provider::SpeechProvider>,
-            > = None;
-            if remote_enabled {
-                #[cfg(not(feature = "remote"))]
-                {
-                    return Err(anyhow::anyhow!(
-                        "Remote speech requires the `remote` feature"
-                    ));
-                }
-            }
-            crate::api::serve(crate::api::ApiConfig {
-                host,
-                port,
-                service,
-                api_key,
-                event_sink: Some(event_sink),
-                cors: cors_enabled,
-                transcription_provider,
-                local_models: Vec::new(),
-                local_model_source: None,
-            })
-            .await
-        }
+        Command::Serve(args) => serve(args, cache_dir).await,
     }
 }
 
-fn serve_event_sink(
-    model_cache_dir: PathBuf,
-    warm_model: Option<String>,
-    engine: CliEngine,
-    remote_enabled: bool,
-    api_key_required: bool,
-    cors_enabled: bool,
-) -> crate::api::ApiEventSink {
-    Arc::new(move |event| {
-        if let Some(base_url) = event.message.strip_prefix("Local API listening on ") {
-            println!(
-                "{}",
-                serve_banner(
-                    base_url,
-                    &model_cache_dir,
-                    warm_model.as_deref(),
-                    engine,
-                    remote_enabled,
-                    api_key_required,
-                    cors_enabled,
-                )
-            );
+async fn serve(args: ServeArgs, cache_dir: PathBuf) -> anyhow::Result<()> {
+    let ServeArgs {
+        host,
+        port,
+        model,
+        engine,
+        api_key,
+        remote_endpoint,
+        remote_api_key,
+        remote_model,
+        cors,
+        no_cors,
+    } = args;
+    let cors_enabled = cors && !no_cors;
+    let remote_endpoint = remote_endpoint
+        .as_deref()
+        .map(str::trim)
+        .filter(|endpoint| !endpoint.is_empty())
+        .map(str::to_string);
+    let remote_enabled = remote_endpoint.is_some();
+    let api_key_required = api_key.as_deref().is_some_and(|key| !key.trim().is_empty());
+
+    let event_sink = serve_event_sink(ServeBanner {
+        model_cache_dir: cache_dir.clone(),
+        warm_model: model.clone(),
+        engine,
+        remote_enabled,
+        api_key_required,
+        cors_enabled,
+    });
+    let service = Arc::new(SpeechService::new_loose_with_engine(cache_dir, engine));
+
+    if !remote_enabled && let Some(model_id) = model.clone() {
+        let warm = Arc::clone(&service);
+        let label = model_id.clone();
+        tokio::task::spawn_blocking(move || warm.preload_and_warm(&model_id))
+            .await
+            .map_err(|err| anyhow!("warm model task failed: {err}"))?
+            .with_context(|| format!("warm model `{label}`"))?;
+    }
+
+    let transcription_provider = match remote_endpoint {
+        #[cfg(feature = "remote")]
+        Some(endpoint) => Some(Arc::new(crate::provider::build_remote_provider(
+            reqwest::Client::new(),
+            crate::remote::RemoteConfig {
+                endpoint,
+                api_key: remote_api_key.unwrap_or_default(),
+                model: remote_model
+                    .or(model)
+                    .filter(|value| !value.trim().is_empty()),
+            },
+            Arc::clone(&service),
+        ))),
+        #[cfg(not(feature = "remote"))]
+        Some(_) => {
+            let _ = (remote_api_key, remote_model);
+            bail!("Remote speech requires the `remote` feature");
         }
+        None => None,
+    };
+
+    crate::api::serve(ApiConfig {
+        host,
+        port,
+        service,
+        api_key,
+        event_sink: Some(event_sink),
+        cors: cors_enabled,
+        transcription_provider,
+        local_models: Vec::new(),
+        local_model_source: None,
     })
+    .await
 }
 
-fn serve_banner(
-    base_url: &str,
-    model_cache_dir: &Path,
-    warm_model: Option<&str>,
-    engine: CliEngine,
+struct ServeBanner {
+    model_cache_dir: PathBuf,
+    warm_model: Option<String>,
+    engine: ModelEngine,
     remote_enabled: bool,
     api_key_required: bool,
     cors_enabled: bool,
-) -> String {
-    let auth = if api_key_required {
-        "API key required"
-    } else {
-        "none"
-    };
-    let cors = if cors_enabled { "enabled" } else { "disabled" };
-    let backend = if remote_enabled {
-        "remote proxy"
-    } else {
-        "local"
-    };
-    let warm = if remote_enabled {
-        warm_model.unwrap_or("configured remote model")
-    } else {
-        warm_model.unwrap_or("none")
-    };
+}
 
-    format!(
-        "Now serving Glimpse Speech API\n\
-         Base URL: {base_url}\n\
-         Serving:\n\
-         - Models: GET {base_url}/v1/models\n\
-         - Transcriptions: POST {base_url}/v1/audio/transcriptions\n\
-         Model cache: {}\n\
-         Backend: {backend}\n\
-         Engine: {}\n\
-         Model: {warm}\n\
-         Auth: {auth}\n\
-         CORS: {cors}",
-        model_cache_dir.display(),
-        ModelEngine::from(engine),
-    )
+impl ServeBanner {
+    fn render(&self, base_url: &str) -> String {
+        let auth = if self.api_key_required {
+            "API key required"
+        } else {
+            "none"
+        };
+        let cors = if self.cors_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        };
+        let backend = if self.remote_enabled {
+            "remote proxy"
+        } else {
+            "local"
+        };
+        let warm = self
+            .warm_model
+            .as_deref()
+            .unwrap_or(if self.remote_enabled {
+                "configured remote model"
+            } else {
+                "none"
+            });
+
+        format!(
+            "Now serving Glimpse Speech API\n\
+             Base URL: {base_url}\n\
+             Serving:\n\
+             - Models: GET {base_url}/v1/models\n\
+             - Transcriptions: POST {base_url}/v1/audio/transcriptions\n\
+             Model cache: {}\n\
+             Backend: {backend}\n\
+             Engine: {}\n\
+             Model: {warm}\n\
+             Auth: {auth}\n\
+             CORS: {cors}",
+            self.model_cache_dir.display(),
+            self.engine,
+        )
+    }
+}
+
+fn serve_event_sink(banner: ServeBanner) -> ApiEventSink {
+    Arc::new(move |event| {
+        if let Some(base_url) = event.message.strip_prefix(LISTENING_PREFIX) {
+            println!("{}", banner.render(base_url));
+        }
+    })
 }
 
 async fn handle_models(
@@ -354,7 +329,7 @@ async fn handle_models(
         } => {
             let artifact = artifact.unwrap_or_else(|| filename_from_url(&url));
             let spec = InstallSpec {
-                id: id.clone(),
+                id,
                 engine: ModelEngine::Whisper,
                 layout: None,
                 storage: ModelStorage::File {
@@ -370,24 +345,24 @@ async fn handle_models(
                 variant: None,
             };
             let status = manager.install(&spec, Default::default()).await?;
-            print_status(status, json)?;
+            print_status(&status, json)?;
         }
         ModelsCommand::Delete { id } => {
             let status = manager.delete(&id)?;
-            print_status(status, json)?;
+            print_status(&status, json)?;
         }
     }
     Ok(())
 }
 
 fn installed_model_ids(cache_dir: &Path) -> Vec<String> {
-    let mut ids = std::fs::read_dir(cache_dir)
+    let mut ids: Vec<String> = std::fs::read_dir(cache_dir)
         .into_iter()
         .flatten()
         .flatten()
         .filter(|entry| entry.path().is_dir())
         .filter_map(|entry| entry.file_name().into_string().ok())
-        .collect::<Vec<_>>();
+        .collect();
     ids.sort();
     ids
 }
@@ -401,9 +376,9 @@ fn filename_from_url(url: &str) -> String {
         .to_string()
 }
 
-fn print_status(status: crate::models::ModelStatus, json: bool) -> anyhow::Result<()> {
+fn print_status(status: &ModelStatus, json: bool) -> anyhow::Result<()> {
     if json {
-        println!("{}", serde_json::to_string_pretty(&status)?);
+        println!("{}", serde_json::to_string_pretty(status)?);
     } else if status.installed {
         println!("{} installed at {}", status.id, status.directory);
     } else {
@@ -421,24 +396,21 @@ fn print_transcription_response(
     response_format: &str,
     json: bool,
 ) -> anyhow::Result<()> {
-    let response_format = if json && response_format == "text" {
-        "json"
-    } else {
-        response_format
+    let format = match response_format.parse::<ResponseFormat>() {
+        Ok(ResponseFormat::Text) if json => ResponseFormat::Json,
+        Ok(format) => format,
+        Err(value) => bail!("Unsupported response_format {value}"),
     };
 
-    match response_format {
-        "json" => println!("{}", serde_json::json!({ "text": response.text })),
-        "verbose_json" => println!("{}", verbose_json(response)?),
-        "text" => println!("{}", response.text),
-        "srt" => print!("{}", format_srt(&response)),
-        "vtt" => print!("{}", format_vtt(&response)),
-        other => anyhow::bail!("Unsupported response_format `{other}`"),
+    match format {
+        ResponseFormat::Json => println!("{}", serde_json::json!({ "text": response.text })),
+        ResponseFormat::VerboseJson => println!("{}", verbose_json(response)?),
+        ResponseFormat::Text => println!("{}", response.text),
+        ResponseFormat::Srt => print!("{}", format_srt(&response)),
+        ResponseFormat::Vtt => print!("{}", format_vtt(&response)),
     }
     Ok(())
 }
-
-use crate::api::{format_srt, format_vtt, verbose_response};
 
 fn verbose_json(response: Transcription) -> anyhow::Result<String> {
     Ok(serde_json::to_string_pretty(&verbose_response(
@@ -468,5 +440,15 @@ mod tests {
         assert_eq!(json["segments"][0]["text"], "hello world");
         assert_eq!(json["segments"][0]["start"], 0.0);
         assert_eq!(json["segments"][0]["end"], 1.5);
+    }
+
+    #[test]
+    fn filename_from_url_strips_query_and_fragment() {
+        assert_eq!(
+            filename_from_url("https://example.test/models/ggml-base.bin?download=1#top"),
+            "ggml-base.bin"
+        );
+        assert_eq!(filename_from_url("https://example.test/"), "example.test");
+        assert_eq!(filename_from_url(""), "model.bin");
     }
 }

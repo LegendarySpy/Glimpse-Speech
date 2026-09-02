@@ -1,7 +1,7 @@
 use reqwest::multipart::{Form, Part};
 
-use crate::remote::ResponseFormat;
 use crate::TimestampGranularity;
+use crate::remote::ResponseFormat;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EndpointProfile {
@@ -334,18 +334,17 @@ fn apply_dictionary_and_prompt(
         }
         DictionaryMode::ContextBias => {
             let mut seen = std::collections::HashSet::new();
-            let mut count = 0;
-            'outer: for term in crate::dictionary::sanitize_dictionary_entries(dictionary) {
-                for token in term.split_whitespace() {
-                    if !seen.insert(token.to_lowercase()) {
-                        continue;
-                    }
-                    form = form.text("context_bias", token.to_string());
-                    count += 1;
-                    if count >= crate::dictionary::MAX_DICTIONARY_ENTRIES {
-                        break 'outer;
-                    }
-                }
+            let tokens = crate::dictionary::sanitize_dictionary_entries(dictionary)
+                .into_iter()
+                .flat_map(|term| {
+                    term.split_whitespace()
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .filter(|token| seen.insert(token.to_lowercase()))
+                .take(crate::dictionary::MAX_DICTIONARY_ENTRIES);
+            for token in tokens {
+                form = form.text("context_bias", token);
             }
             if let Some(prompt) = trimmed_prompt {
                 form = form.text("prompt", prompt.to_string());

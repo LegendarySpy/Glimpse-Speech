@@ -1,10 +1,10 @@
-use std::{borrow::Cow, path::Path};
+use std::path::Path;
 
 use parakeet_rs::{Nemotron, NemotronMode};
 
 use crate::{
-    engines::{io_error, validate_model_dir},
     TranscriptionEngine, TranscriptionResult,
+    engines::{io_error, validate_model_dir},
 };
 
 /// Chunk size in samples for streaming (560ms at 16kHz).
@@ -40,15 +40,16 @@ impl NemotronEngine {
         &mut self,
         samples: &[f32],
     ) -> Result<String, Box<dyn std::error::Error>> {
-        let runtime = self.runtime_mut()?;
-        runtime.transcribe_chunk(samples).map_err(nemotron_error)
+        self.runtime_mut()?
+            .transcribe_chunk(samples)
+            .map_err(nemotron_error)
     }
 
     /// Get the full accumulated transcript from all chunks processed so far.
     pub fn get_transcript(&self) -> String {
         self.runtime
             .as_ref()
-            .map(|r| r.get_transcript())
+            .map(Nemotron::get_transcript)
             .unwrap_or_default()
     }
 
@@ -94,12 +95,14 @@ impl TranscriptionEngine for NemotronEngine {
         params: Option<Self::InferenceParams>,
     ) -> Result<TranscriptionResult, Box<dyn std::error::Error>> {
         let runtime = self.runtime_mut()?;
-        apply_language(runtime, params.as_ref().and_then(|p| p.language.as_deref()))?;
+        let language = params
+            .as_ref()
+            .and_then(|params| params.language.as_deref());
+        apply_language(runtime, language)?;
         runtime.reset();
 
-        // Feed all audio through the streaming interface in chunks
         for chunk in samples.chunks(STREAMING_CHUNK_SAMPLES) {
-            let _ = runtime.transcribe_chunk(chunk).map_err(nemotron_error)?;
+            runtime.transcribe_chunk(chunk).map_err(nemotron_error)?;
         }
 
         let text = runtime.get_transcript().trim().to_string();
@@ -125,38 +128,43 @@ fn apply_language(
     if runtime.mode() != NemotronMode::Multilingual {
         return Ok(());
     }
-
-    let Some(language) = language.and_then(nemotron_language) else {
+    let Some(language) = language else {
         return Ok(());
     };
-
     runtime
-        .set_target_lang(language.as_ref())
+        .set_target_lang(nemotron_language(language))
         .map_err(nemotron_error)
 }
 
-fn nemotron_language(language: &str) -> Option<Cow<'_, str>> {
+/// Maps a caller-supplied language tag onto one the multilingual Nemotron
+/// model accepts, falling back to automatic detection for anything else.
+fn nemotron_language(language: &str) -> &str {
     let language = language.trim();
     if language.is_empty() || language == "auto" {
-        return Some(Cow::Borrowed("auto"));
+        return "auto";
     }
-
-    match language {
-        "he" => return Some(Cow::Borrowed("he-IL")),
-        "ja" => return Some(Cow::Borrowed("ja-JP")),
-        "mt" => return Some(Cow::Borrowed("mt-MT")),
-        "th" => return Some(Cow::Borrowed("th-TH")),
-        "vi" => return Some(Cow::Borrowed("vi-VN")),
-        "zh" => return Some(Cow::Borrowed("zh-CN")),
-        _ => {}
+    if let Some((_, regional)) = REGIONAL_ALIASES
+        .iter()
+        .find(|(short, _)| *short == language)
+    {
+        return regional;
     }
-
     if NEMOTRON_LANGUAGE_CODES.contains(&language) {
-        Some(Cow::Borrowed(language))
+        language
     } else {
-        Some(Cow::Borrowed("auto"))
+        "auto"
     }
 }
+
+/// Languages the model only knows by their regional tag.
+const REGIONAL_ALIASES: &[(&str, &str)] = &[
+    ("he", "he-IL"),
+    ("ja", "ja-JP"),
+    ("mt", "mt-MT"),
+    ("th", "th-TH"),
+    ("vi", "vi-VN"),
+    ("zh", "zh-CN"),
+];
 
 const NEMOTRON_LANGUAGE_CODES: &[&str] = &[
     "ar", "ar-AR", "bg", "bg-BG", "cs", "cs-CZ", "da", "da-DK", "de", "de-DE", "el", "el-GR", "en",
@@ -166,3 +174,17 @@ const NEMOTRON_LANGUAGE_CODES: &[&str] = &[
     "pl-PL", "pt", "pt-BR", "pt-PT", "ro", "ro-RO", "ru", "ru-RU", "sk", "sk-SK", "sl", "sl-SI",
     "sv", "sv-SE", "th-TH", "tr", "tr-TR", "uk", "uk-UA", "vi-VN", "zh-CN",
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::nemotron_language;
+
+    #[test]
+    fn maps_language_tags_onto_supported_codes() {
+        assert_eq!(nemotron_language(""), "auto");
+        assert_eq!(nemotron_language(" auto "), "auto");
+        assert_eq!(nemotron_language("ja"), "ja-JP");
+        assert_eq!(nemotron_language("en-GB"), "en-GB");
+        assert_eq!(nemotron_language("xx"), "auto");
+    }
+}

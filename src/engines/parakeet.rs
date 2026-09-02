@@ -3,15 +3,15 @@ use std::path::Path;
 use parakeet_rs::{ParakeetTDT, ParakeetUnified, TimestampMode, Transcriber};
 
 use crate::{
+    TranscriptionEngine, TranscriptionResult, TranscriptionSegment,
     dictionary::sanitize_dictionary_entries,
     engines::{io_error, validate_model_dir},
     models::ModelLayout,
-    TranscriptionEngine, TranscriptionResult, TranscriptionSegment,
 };
 
 const SAMPLE_RATE: u32 = 16_000;
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum TimestampGranularity {
     #[default]
     Token,
@@ -61,21 +61,11 @@ impl ParakeetModelParams {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ParakeetInferenceParams {
     pub timestamp_granularity: TimestampGranularity,
     pub language: Option<String>,
     pub dictionary: Vec<String>,
-}
-
-impl Default for ParakeetInferenceParams {
-    fn default() -> Self {
-        Self {
-            timestamp_granularity: TimestampGranularity::Token,
-            language: None,
-            dictionary: Vec::new(),
-        }
-    }
 }
 
 #[derive(Default)]
@@ -106,7 +96,7 @@ impl ParakeetEngine {
     ) -> Result<TranscriptionResult, Box<dyn std::error::Error>> {
         let runtime = self.runtime_mut()?;
         let params = normalize_inference_params(params);
-        let mode = map_timestamp_mode(params.timestamp_granularity.clone());
+        let mode = TimestampMode::from(params.timestamp_granularity);
 
         // Current parakeet-rs TDT path does not expose explicit language forcing
         // or dictionary boosting, so these are currently no-ops.
@@ -205,18 +195,12 @@ fn map_result(
 
     let mapped: Vec<TranscriptionSegment> = tokens
         .into_iter()
-        .filter_map(|token| {
-            let text = token.text.trim().to_string();
-            if text.is_empty() {
-                None
-            } else {
-                Some(TranscriptionSegment {
-                    start: token.start,
-                    end: token.end,
-                    text,
-                })
-            }
+        .map(|token| TranscriptionSegment {
+            start: token.start,
+            end: token.end,
+            text: token.text.trim().to_string(),
         })
+        .filter(|segment| !segment.text.is_empty())
         .collect();
 
     let (segments, words) = match timestamp_granularity {
@@ -275,11 +259,13 @@ fn group_words_into_sentences(words: &[TranscriptionSegment]) -> Vec<Transcripti
     sentences
 }
 
-fn map_timestamp_mode(granularity: TimestampGranularity) -> TimestampMode {
-    match granularity {
-        TimestampGranularity::Token => TimestampMode::Tokens,
-        TimestampGranularity::Word => TimestampMode::Words,
-        TimestampGranularity::Segment => TimestampMode::Sentences,
+impl From<TimestampGranularity> for TimestampMode {
+    fn from(granularity: TimestampGranularity) -> Self {
+        match granularity {
+            TimestampGranularity::Token => Self::Tokens,
+            TimestampGranularity::Word => Self::Words,
+            TimestampGranularity::Segment => Self::Sentences,
+        }
     }
 }
 

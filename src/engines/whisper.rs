@@ -3,8 +3,8 @@ use std::{path::Path, time::Instant};
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
 use crate::{
-    dictionary::build_dictionary_prompt, engines::io_error, TranscriptionEngine,
-    TranscriptionResult, TranscriptionSegment,
+    TranscriptionEngine, TranscriptionResult, TranscriptionSegment,
+    dictionary::build_dictionary_prompt, engines::io_error,
 };
 
 #[derive(Debug, Clone)]
@@ -115,9 +115,12 @@ impl TranscriptionEngine for WhisperEngine {
         let model_bytes = std::fs::metadata(model_path)
             .ok()
             .map(|metadata| metadata.len());
-        let use_gpu = params.use_gpu;
-        let gpu_device = params.gpu_device;
-        let has_dtw = params.dtw_preset.is_some();
+        let WhisperModelParams {
+            use_gpu,
+            gpu_device,
+            dtw_preset,
+        } = params;
+        let has_dtw = dtw_preset.is_some();
         let model_path_str = model_path
             .to_str()
             .ok_or_else(|| io_error("model path is not valid UTF-8"))?;
@@ -133,7 +136,7 @@ impl TranscriptionEngine for WhisperEngine {
         };
         // DTW cross-attention alignment gives accurate word timestamps; the
         // energy heuristic used otherwise drifts.
-        if let Some(model_preset) = params.dtw_preset {
+        if let Some(model_preset) = dtw_preset {
             context_params.dtw_parameters = whisper_rs::DtwParameters {
                 mode: whisper_rs::DtwMode::ModelPreset { model_preset },
                 ..whisper_rs::DtwParameters::default()
@@ -255,7 +258,7 @@ impl TranscriptionEngine for WhisperEngine {
 
 fn log_coreml_lines(phase: &str) {
     for line in crate::take_coreml_log() {
-        tracing::info!("[WhisperEngine] coreml phase={} {}", phase, line);
+        tracing::info!("[WhisperEngine] coreml phase={phase} {line}");
     }
 }
 
@@ -264,33 +267,23 @@ fn append_segment_words(
     eot_token: whisper_rs::WhisperTokenId,
     words: &mut Vec<TranscriptionSegment>,
 ) {
-    let mut tokens: Vec<(String, whisper_rs::WhisperTokenData)> = Vec::new();
-    for index in 0..segment.n_tokens() {
-        let Some(token) = segment.get_token(index) else {
-            continue;
-        };
-        if token.token_id() >= eot_token {
-            continue;
-        }
-        let Ok(piece) = token.to_str_lossy() else {
-            continue;
-        };
-        if piece.trim().is_empty() {
-            continue;
-        }
-        tokens.push((piece.into_owned(), token.token_data()));
-    }
+    let tokens: Vec<(String, whisper_rs::WhisperTokenData)> = (0..segment.n_tokens())
+        .filter_map(|index| segment.get_token(index))
+        .filter(|token| token.token_id() < eot_token)
+        .filter_map(|token| {
+            let piece = token.to_str_lossy().ok()?;
+            (!piece.trim().is_empty()).then(|| (piece.into_owned(), token.token_data()))
+        })
+        .collect();
 
     // With DTW, t_dtw is the aligned onset of each token, so a token ends
     // where the next one begins. Without it, fall back to the t0/t1 heuristic.
-    let use_dtw = tokens.iter().all(|(_, data)| data.t_dtw >= 0) && !tokens.is_empty();
-    for index in 0..tokens.len() {
-        let (piece, data) = &tokens[index];
+    let use_dtw = !tokens.is_empty() && tokens.iter().all(|(_, data)| data.t_dtw >= 0);
+    for (index, (piece, data)) in tokens.iter().enumerate() {
         let (start_cs, end_cs) = if use_dtw {
             let end = tokens
                 .get(index + 1)
-                .map(|(_, next)| next.t_dtw)
-                .unwrap_or(data.t1.max(data.t_dtw));
+                .map_or(data.t1.max(data.t_dtw), |(_, next)| next.t_dtw);
             (data.t_dtw, end.max(data.t_dtw))
         } else {
             (data.t0, data.t1.max(data.t0))

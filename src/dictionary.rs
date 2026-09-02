@@ -3,60 +3,40 @@ use std::collections::HashSet;
 pub(crate) const MAX_DICTIONARY_ENTRIES: usize = 64;
 const MAX_DICTIONARY_TERM_CHARS: usize = 160;
 const MAX_PROMPT_BYTES: usize = 600;
+const TERM_SEPARATOR: &str = ", ";
 
 pub fn sanitize_dictionary_entries(entries: &[String]) -> Vec<String> {
     let mut seen = HashSet::new();
-    let mut cleaned = Vec::new();
-
-    for raw in entries {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        let normalized = trimmed.to_lowercase();
-        if !seen.insert(normalized) {
-            continue;
-        }
-
-        let capped: String = trimmed.chars().take(MAX_DICTIONARY_TERM_CHARS).collect();
-        let capped = capped.trim_end().to_string();
-        cleaned.push(capped);
-
-        if cleaned.len() >= MAX_DICTIONARY_ENTRIES {
-            break;
-        }
-    }
-
-    cleaned
+    entries
+        .iter()
+        .map(|raw| raw.trim())
+        .filter(|trimmed| !trimmed.is_empty())
+        .filter(|trimmed| seen.insert(trimmed.to_lowercase()))
+        .map(|trimmed| {
+            let capped: String = trimmed.chars().take(MAX_DICTIONARY_TERM_CHARS).collect();
+            capped.trim_end().to_string()
+        })
+        .take(MAX_DICTIONARY_ENTRIES)
+        .collect()
 }
 
 pub fn build_dictionary_prompt(entries: &[String]) -> Option<String> {
-    let cleaned = sanitize_dictionary_entries(entries);
-    if cleaned.is_empty() {
-        return None;
-    }
-
     let mut prompt = String::new();
-    let mut added_any = false;
-
-    for (idx, term) in cleaned.iter().enumerate() {
-        let separator = if idx > 0 { ", " } else { "" };
-        let would_len = prompt.len() + separator.len() + term.len() + 1;
-
-        if would_len > MAX_PROMPT_BYTES {
+    for term in sanitize_dictionary_entries(entries) {
+        let separator = if prompt.is_empty() {
+            ""
+        } else {
+            TERM_SEPARATOR
+        };
+        if prompt.len() + separator.len() + term.len() + 1 > MAX_PROMPT_BYTES {
             break;
         }
-
         prompt.push_str(separator);
-        prompt.push_str(term);
-        added_any = true;
+        prompt.push_str(&term);
     }
-
-    if !added_any {
+    if prompt.is_empty() {
         return None;
     }
-
     prompt.push('.');
     Some(prompt)
 }
@@ -81,5 +61,12 @@ mod tests {
     fn build_dictionary_prompt_joins_terms() {
         let prompt = build_dictionary_prompt(&["alpha".to_string(), "beta".to_string()]);
         assert_eq!(prompt.as_deref(), Some("alpha, beta."));
+    }
+
+    #[test]
+    fn build_dictionary_prompt_is_none_without_usable_terms() {
+        assert_eq!(build_dictionary_prompt(&[]), None);
+        assert_eq!(build_dictionary_prompt(&["   ".to_string()]), None);
+        assert_eq!(build_dictionary_prompt(&["\u{1F600}".repeat(160)]), None);
     }
 }
